@@ -285,6 +285,11 @@ static Audio audio(false, 3, I2S_NUM_1);  // 外部 DAC、双声道、I2S 端口
 #endif
 static bool    i2sConfigured = false;     // setPinout/音量 只做一次
 static bool    es8311Ready   = false;     // ES8311 初始化成功标志
+// StickS3 欠压规避：功放使能延后 + 音量淡入，错开 connecttohost 的
+// WiFi/TLS 电流尖峰（否则第一次播放 brownout 直接重启）
+static uint32_t ampEnableAt = 0;  // 功放计划使能时刻，0=无待办
+static int      ampFadeNow  = 0;  // 当前淡入音量，0=淡入已完成/未开始
+static uint32_t ampFadeAt   = 0;  // 下一次淡入步进时刻
 static bool    paused        = false;     // 用户暂停态
 static bool    wifiDropPause = false;     // 播放中因 WiFi 掉线被停掉，等恢复后提示重播
 
@@ -491,13 +496,46 @@ static bool initEs8311() {
   bool ok = true;
   for (auto& r : seq) ok = es8311Write(addr, r[0], r[1]) && ok;
 #ifdef PODCAST_TARGET_STICKS3
-  // StickS3：ES8311 就绪后还要打开功放（M5Unified speaker 回调同款操作）
-  if (ok) {
-    M5.In_I2C.bitOn(M5PM1_ADDR, 0x11, 0b00001000, 100000);
-  }
+  // StickS3 的功放使能不在这里做：bitOn 瞬间电流冲击若与 connecttohost
+  // 的 TLS 握手重叠会触发 brownout，改为 startPlayback 成功后由
+  // ampTick() 延时使能（见 ampEnableAt）
 #endif
   Serial.printf("[audio] ES8311 init @0x%02X %s\n", addr, ok ? "ok" : "FAIL");
   return ok;
+}
+
+// 功放开关（仅 StickS3 有独立 PA 使能位；Cardputer 功放随 codec 输出）
+static void setAmp(bool on) {
+#ifdef PODCAST_TARGET_STICKS3
+  if (on) M5.In_I2C.bitOn(M5PM1_ADDR, 0x11, 0b00001000, 100000);
+  else    M5.In_I2C.bitOff(M5PM1_ADDR, 0x11, 0b00001000, 100000);
+#else
+  (void)on;
+#endif
+}
+
+// loop 每圈调用：到期使能功放并分步淡入音量（非阻塞）。
+// 使能后先压到低音量，150ms 一步升到用户音量，避免 pop 与二次电流冲击
+static void ampTick() {
+  if (ampEnableAt != 0 && (int32_t)(millis() - ampEnableAt) >= 0) {
+    ampEnableAt = 0;
+    setAmp(true);
+    ampFadeNow = 3;
+    audio.setVolume(ampFadeNow);
+    ampFadeAt = millis() + 150;
+    Serial.println("[audio] amp on (delayed)");
+  }
+  if (ampFadeNow != 0 && (int32_t)(millis() - ampFadeAt) >= 0) {
+    int target = player.volume;
+    ampFadeNow += 3;
+    if (ampFadeNow >= target) {
+      audio.setVolume(target);
+      ampFadeNow = 0;
+    } else {
+      audio.setVolume(ampFadeNow);
+      ampFadeAt = millis() + 150;
+    }
+  }
 }
 
 // --------------------------- 播放控制 ---------------------------
@@ -507,6 +545,10 @@ static void startPlayback(int idx) {
   paused = false;
   wifiDropPause = false;  // 用户主动开播，清除掉线等待标记
   player.current = idx;
+  // 连接期间保持功放关闭：使能时刻延后到连接成功 600ms 后（ampTick），
+  // 与 DNS+TLS+首块下载的 WiFi 电流尖峰错开，避免 brownout 重启
+  setAmp(false);
+  ampFadeNow = 0;
 
   // connecttohost 会同步阻塞数秒（DNS+TLS+GET+m4a 头解析），先画提示
   statusMsg = "缓冲中...";
@@ -544,6 +586,11 @@ static void startPlayback(int idx) {
     // I2S 时钟已在运行，此刻初始化 ES8311 与 M5Unified 时机一致
     es8311Ready = initEs8311();
     if (!es8311Ready) Serial.println("[audio] ES8311 init failed, no sound");
+  }
+  if (ok && es8311Ready) {
+    // 600ms 后 loop->ampTick 再开功放并淡入：此时 TLS 突发已过，
+    // 输入环（12KB，约 1s 音频）足矣覆盖这段无喂流间隙
+    ampEnableAt = millis() + 600;
   }
   statusMsg = ok ? "" : "连接失败";
   view = VIEW_PLAYER;   // 进入播放页
@@ -1329,6 +1376,7 @@ void loop() {
   M5Cardputer.update();
 #endif
   handleKeys();
+  ampTick();  // 延时使能功放 + 音量淡入（欠压规避）
 
   // 喂解码器（暂停时内部直接返回）。EOF 检测：
   // 上一轮还在运行、这一轮没了、且不是用户主动暂停 -> 播放完毕
