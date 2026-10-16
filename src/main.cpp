@@ -32,7 +32,11 @@
 // =====================================================================
 
 #include <M5Unified.h>
+#ifdef PODCAST_TARGET_STICKS3
+// StickS3：无键盘，双键输入；M5Unified 运行时自动识别板卡
+#else
 #include <M5Cardputer.h>
+#endif
 
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -65,16 +69,46 @@
 // 列表页按 Tab 打开频道切换页（Esc 键键盘库不上报，用 Tab 代替）。
 static const char* AP_NAME = "PodcastPlayer";  // 配网热点名
 
+#ifdef PODCAST_TARGET_STICKS3
+// StickS3 版写死的唯一频道（换台改这两行后重新编译）
+static const char* const STICKS3_CHANNEL_NAME = "霓达播客";
+static const char* const STICKS3_CHANNEL_RSS =
+    "https://feed.xyzfm.space/xlgejk3wbj8q";
+
+// StickS3 板载 ES8311 声卡：I2S_NUM_0，引脚照抄 M5Unified 0.2.26
+// board_M5StickS3 的 speaker 配置（MCLK=BCLK，codec 无需独立 MCLK）
+static constexpr int PIN_I2S_BCLK = 17;
+static constexpr int PIN_I2S_WS   = 15;
+static constexpr int PIN_I2S_DOUT = 14;
+static constexpr int PIN_I2S_MCLK = 18;
+// 功放(PA)由电源芯片 M5PM1@0x6E 的 gpio3 控制（寄存器 0x11 bit3）
+static constexpr uint8_t M5PM1_ADDR = 0x6E;
+#else
 // Cardputer ADV 板载音频引脚（与 M5Unified 0.2.26 对 CardputerADV 的
 // speaker 配置一致：I2S_NUM_1，无 MCLK）
 static constexpr int PIN_I2S_BCLK = 41;
 static constexpr int PIN_I2S_WS   = 43;
 static constexpr int PIN_I2S_DOUT = 42;
+#endif
+
+// 操作提示文案按目标区分（无键盘设备用 A/B 键说法）
+#ifdef PODCAST_TARGET_STICKS3
+static const char* const HINT_RETRY = "B键重试拉取";
+static const char* const HINT_BACK  = "A键:返回列表";
+#else
+static const char* const HINT_RETRY = "Enter重试拉取";
+static const char* const HINT_BACK  = "w/s:返回列表";
+#endif
 
 static constexpr uint8_t ES8311_ADDR = 0x18;  // 备用地址 0x19
 
-static constexpr size_t   MAX_EPISODES   = 60;        // 最多解析集数
-static constexpr size_t   MAX_ITEM_BYTES = 48 * 1024; // 单条 item 上限
+// 内存取舍（无 PSRAM，320KB SRAM）：
+//   MAX_EPISODES   30 集 ≈ 10KB 常驻（feed 实测 163 条，翻不了那么深）
+//   MAX_ITEM_BYTES 实测已有条目超 16KB（shownotes 长的节目），32KB 上限；
+//                  超限条目重新同步到下一条（见 fetchEpisodesFrom）
+//   audio 输入环   setBufsize 12KB（见 startPlayback），按 96kbps ≈ 1~1.5s
+static constexpr size_t   MAX_EPISODES   = 30;        // 最多解析集数
+static constexpr size_t   MAX_ITEM_BYTES = 32 * 1024; // 单条 item 上限
 static constexpr size_t   MAX_FEED_BYTES = 2u * 1024 * 1024;  // 订阅源读取上限
 static constexpr int      VOLUME_MAX     = 16;
 static constexpr uint8_t  VOLUME_DEFAULT = 12;
@@ -159,7 +193,7 @@ static uint16_t coverTopColor(const std::string& name) {
 // 文字封面：垂直渐变底 + 内圈角标 + 居中大字频道名 + 底部装饰线
 static void drawCoverArt(int x, int y, int w, int h,
                          const std::string& name) {
-  auto& d = M5Cardputer.Display;
+  auto& d = M5.Display;
   const CoverScheme& sc = kCoverSchemes[nameHash(name) % kSchemeCount];
 
   // 渐变底（逐行插值）
@@ -244,10 +278,15 @@ static bool wifiOk    = false;
 static bool uiDirty   = true;       // 需要整页重绘
 static std::string statusMsg;       // 状态栏中间的提示文字（如"缓冲中..."）
 
+#ifdef PODCAST_TARGET_STICKS3
+static Audio audio(false, 3, I2S_NUM_0);  // StickS3 声卡（ES8311）在 I2S 端口 0
+#else
 static Audio audio(false, 3, I2S_NUM_1);  // 外部 DAC、双声道、I2S 端口 1
+#endif
 static bool    i2sConfigured = false;     // setPinout/音量 只做一次
 static bool    es8311Ready   = false;     // ES8311 初始化成功标志
 static bool    paused        = false;     // 用户暂停态
+static bool    wifiDropPause = false;     // 播放中因 WiFi 掉线被停掉，等恢复后提示重播
 
 static struct {
   int     current = -1;                  // 当前加载的集数下标
@@ -269,7 +308,7 @@ static bool openPortal();        // 重新打开配网热点（列表页按 0）
 // 配网说明页：手机连接设备热点后，DNS 劫持会自动弹出配置页；
 // setAPCallback 在热点就绪时由 WiFiManager 调用
 static void drawPortalScreen() {
-  auto& d = M5Cardputer.Display;
+  auto& d = M5.Display;
   d.fillScreen(C_BG);
   d.setTextDatum(m5gfx::textdatum_t::top_left);
   d.setFont(&fonts::efontCN_16);
@@ -293,7 +332,10 @@ static bool openPortal() {
   wm.setAPCallback([](WiFiManager*) { drawPortalScreen(); });
   bool ok = wm.startConfigPortal(AP_NAME);
   wifiOk = ok && (WiFi.status() == WL_CONNECTED);
-  if (wifiOk) WiFi.setSleep(false);  // 在线串流需要稳定吞吐
+  if (wifiOk) {
+    WiFi.setSleep(false);           // 在线串流需要稳定吞吐
+    WiFi.setAutoReconnect(true);    // 路由器闪断后底层自动重连
+  }
   uiDirty = true;                    // 恢复主界面（loop 里重绘）
   return wifiOk;
 }
@@ -420,7 +462,7 @@ static std::string fmtTime(uint32_t sec) {
 // 经由 M5Unified 的内部 I2C 总线（CardputerADV：SDA=8 / SCL=9，M5.begin
 // 已自动初始化）写 ES8311 寄存器
 static bool es8311Write(uint8_t addr, uint8_t reg, uint8_t val) {
-  return M5Cardputer.In_I2C.writeRegister8(addr, reg, val, 100000);
+  return M5.In_I2C.writeRegister8(addr, reg, val, 100000);
 }
 
 // ES8311 初始化。寄存器序列逐字照抄 M5Unified 0.2.26 的
@@ -448,6 +490,12 @@ static bool initEs8311() {
   };
   bool ok = true;
   for (auto& r : seq) ok = es8311Write(addr, r[0], r[1]) && ok;
+#ifdef PODCAST_TARGET_STICKS3
+  // StickS3：ES8311 就绪后还要打开功放（M5Unified speaker 回调同款操作）
+  if (ok) {
+    M5.In_I2C.bitOn(M5PM1_ADDR, 0x11, 0b00001000, 100000);
+  }
+#endif
   Serial.printf("[audio] ES8311 init @0x%02X %s\n", addr, ok ? "ok" : "FAIL");
   return ok;
 }
@@ -457,6 +505,7 @@ static bool initEs8311() {
 static void startPlayback(int idx) {
   if (audio.isRunning()) audio.stopSong();
   paused = false;
+  wifiDropPause = false;  // 用户主动开播，清除掉线等待标记
   player.current = idx;
 
   // connecttohost 会同步阻塞数秒（DNS+TLS+GET+m4a 头解析），先画提示
@@ -467,14 +516,30 @@ static void startPlayback(int idx) {
 
   if (!i2sConfigured) {
     // 无 MCLK 引脚（ES8311 已配置 MCLK=BCLK）
+#ifdef PODCAST_TARGET_STICKS3
+    audio.setPinout(PIN_I2S_BCLK, PIN_I2S_WS, PIN_I2S_DOUT, PIN_I2S_MCLK);
+#else
     audio.setPinout(PIN_I2S_BCLK, PIN_I2S_WS, PIN_I2S_DOUT);
+#endif
+    // 注意：audioI2S 3.0.12 在构造函数里已 InBuff.init()（固定 16000B），
+    // setBufsize() 会被 isInitialized() 拒绝，改不了缓冲大小
     audio.setVolumeSteps(VOLUME_MAX);
     audio.setVolume(player.volume);
     audio.setConnectionTimeout(8000, 15000);
     i2sConfigured = true;
   }
 
+  // 直连 https 原始地址。不要改成 http 明文：本源音频走
+  // dts-api.xiaoyuzhoufm.com 中转，对 http 请求返回 302 且 Location 为
+  // 全大写 "HTTPS://..."，audioI2S 3.0.12 无法解析该重定向，表现为
+  // "连接成功"但流内无音频（时长一直 --:--:--）。
+  // https 请求的重定向为小写 https://media.xyzcdn.net/... 直链，工作正常。
+  uint32_t t0 = millis();
+  Serial.printf("[audio] startPlayback idx=%d heap=%u\n", idx,
+                (unsigned)ESP.getFreeHeap());
   bool ok = audio.connecttohost(episodes[idx].url.c_str());
+  Serial.printf("[audio] connecttohost returned ok=%d after %ums\n",
+                (int)ok, (unsigned)(millis() - t0));
   if (ok && !es8311Ready) {
     // I2S 时钟已在运行，此刻初始化 ES8311 与 M5Unified 时机一致
     es8311Ready = initEs8311();
@@ -506,12 +571,18 @@ static void parseEpisodeXml(const std::string& xml, std::vector<Episode>& out) {
 }
 
 // 流式拉取 RSS：滑动窗口只缓冲单条 <item>，其余内容即读即弃。
-// 返回是否至少解析出一集。
-static bool fetchEpisodes(std::vector<Episode>& eps) {
-  WiFiClientSecure client;
-  client.setInsecure();  // 自用：跳过 HTTPS 证书校验
+// 返回是否至少解析出一集。isHttps=false 走明文 WiFiClient，
+// 绕开 mbedtls（TLS 栈内存占用大，是拉取阶段的最大堆峰值面）；
+// 明文下遇到跳 https 的重定向会失败，由上层回退处理。
+static bool fetchEpisodesFrom(const char* url, bool isHttps,
+                              std::vector<Episode>& eps) {
+  WiFiClientSecure secureClient;
+  WiFiClient       plainClient;
   HTTPClient http;
-  if (!http.begin(client, channels[chanIdx].rss.c_str())) return false;
+  if (isHttps) secureClient.setInsecure();  // 自用：跳过 HTTPS 证书校验
+  bool began = isHttps ? http.begin(secureClient, url)
+                       : http.begin(plainClient, url);
+  if (!began) return false;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.setUserAgent("CardputerPodcast/1.0");
   http.setConnectTimeout(10000);
@@ -556,17 +627,27 @@ static bool fetchEpisodes(std::vector<Episode>& eps) {
       if (pos != std::string::npos) {
         // 完整的一条 item：交给 TinyXML2 解析
         parseEpisodeXml(item.substr(0, pos + 7), eps);
-        // 剩余内容回到 pending，继续找下一条 <item>
-        pending = item.substr(pos + 7);
-        if (pending.size() > 8) pending.erase(0, pending.size() - 8);
+        // 剩余内容只回填尾部 8 字节（足够匹配跨块的 "<item"），
+        // 不整段复制 item 尾部（可达数 KB 的纯浪费副本）
+        size_t remStart = pos + 7;
+        if (item.size() - remStart > 8) remStart = item.size() - 8;
+        pending.assign(item, remStart, std::string::npos);
         item.clear();
         inItem = false;
       } else if (item.size() > MAX_ITEM_BYTES) {
-        // 异常超长条目，整条跳过
-        Serial.println("[rss] item too large, skipped");
-        item.clear();
-        pending.clear();
-        inItem = false;
+        // 异常超长条目：不能整条 clear——缓冲里可能已含下一个 <item 的
+        // 开头，直接丢弃会让后续条目解析错位（URL 拼接损坏）。
+        // 改为在缓冲内重新同步到下一个 <item：
+        size_t nxt = item.find("<item", 1);
+        if (nxt != std::string::npos) {
+          item.erase(0, nxt);  // 从下一条 item 开头继续收集
+        } else {
+          // 缓冲内没有下一条：只保留尾部 8 字节用于跨块匹配 "<item"
+          pending.assign(item, item.size() - 8, std::string::npos);
+          item.clear();
+          inItem = false;
+        }
+        Serial.println("[rss] item too large, resynced");
       }
     }
   }
@@ -574,6 +655,21 @@ static bool fetchEpisodes(std::vector<Episode>& eps) {
   Serial.printf("[rss] %u episodes, %u bytes\n",
                 (unsigned)eps.size(), (unsigned)total);
   return !eps.empty();
+}
+
+// 与播放同策略：先试 http 明文直链（省下 mbedtls 的几十 KB 堆峰值），
+// 失败再回退原 https 地址。
+static bool fetchEpisodes(std::vector<Episode>& eps) {
+  String rss = String(channels[chanIdx].rss.c_str());
+  if (rss.startsWith("http://")) {
+    return fetchEpisodesFrom(rss.c_str(), false, eps);
+  }
+  String httpUrl = rss;
+  httpUrl.replace("https://", "http://");
+  Serial.printf("[rss] try http: %s\n", httpUrl.c_str());
+  if (fetchEpisodesFrom(httpUrl.c_str(), false, eps)) return true;
+  Serial.println("[rss] http failed, fallback to https");
+  return fetchEpisodesFrom(rss.c_str(), true, eps);
 }
 
 // 带屏幕提示的拉取入口（首次启动与列表为空时按 Enter 重试共用）
@@ -630,7 +726,7 @@ static void syncScroll() {
 
 // 状态栏：WiFi | 状态提示（自动限宽） | 音量
 static void drawStatusBar() {
-  auto& d = M5Cardputer.Display;
+  auto& d = M5.Display;
   d.fillRect(0, 0, d.width(), listTop - 2, C_BG);
 
   d.setTextColor(wifiOk ? C_ACCENT : C_DIM, C_BG);
@@ -663,14 +759,14 @@ static void drawStatusBar() {
 
 // 列表页
 static void drawListPage() {
-  auto& d = M5Cardputer.Display;
+  auto& d = M5.Display;
   // 先清整个列表区（状态栏以下的全部），否则光标移动/滚动后旧帧文字
   // 和旧选中条残留在行间缝隙里，看起来"透出下面一层"
   d.fillRect(0, listTop - 2, d.width(), d.height() - listTop + 2, C_BG);
   if (episodes.empty()) {
     d.setTextColor(C_DIM, C_BG);
     d.drawString("节目列表为空", 2, listTop);
-    d.drawString("Enter重试拉取", 2, listTop + lineHeight);
+    d.drawString(HINT_RETRY, 2, listTop + lineHeight);
   } else {
     for (int row = 0; row < listLines; ++row) {
       int idx = scrollTop + row;
@@ -699,14 +795,14 @@ static void drawListPage() {
 
 // 进度条 + 时间（局部刷新用）
 static void drawProgressArea() {
-  auto& d = M5Cardputer.Display;
+  auto& d = M5.Display;
   constexpr int PX = 116, PW = 120;
   d.fillRect(PX, 80, PW, 26, C_BG);
 
   uint32_t dur = audio.getAudioFileDuration();
   uint32_t cur = audio.getAudioCurrentTime();
-  if (dur == 0) { cur = 0; }
-  if (cur > dur && dur > 0) cur = dur;
+  // dur 未知（0）时保留 cur：已播时间照样走，只是总时长显示 --:--
+  if (dur > 0 && cur > dur) cur = dur;
 
   // 进度条
   d.fillRect(PX, 82, PW, 6, C_BAR_BG);
@@ -730,7 +826,7 @@ static void drawProgressArea() {
 
 // 播放页：封面 + 节目名 + 标题 + 进度（full=false 只刷进度区）
 static void drawPlayerPage(bool full) {
-  auto& d = M5Cardputer.Display;
+  auto& d = M5.Display;
   if (full) {
     d.fillScreen(C_BG);
 
@@ -752,14 +848,14 @@ static void drawPlayerPage(bool full) {
     }
     // 底部操作提示
     d.setTextColor(C_DIM, C_BG);
-    d.drawString("w/s:返回列表", 116, 116);
+    d.drawString(HINT_BACK, 116, 116);
   }
   drawProgressArea();
 }
 
 // 频道切换页：光标选频道，* 标记当前频道，Enter 确认切换
 static void drawChannelPage() {
-  auto& d = M5Cardputer.Display;
+  auto& d = M5.Display;
   d.fillScreen(C_BG);
   d.setTextColor(C_ACCENT, C_BG);
   d.drawString("选择频道", 2, 1);
@@ -815,6 +911,48 @@ static void returnToLauncher() {
 }
 
 static void handleKeys() {
+#ifdef PODCAST_TARGET_STICKS3
+  // ---- StickS3 双键输入层：把 BtnA/BtnB 事件翻译成与键盘一致的输入原语 ----
+  // 列表页: A单击=下移  A长按连发=上移  B单击=播放选中  B长按1.5s=WiFi配网
+  // 播放页: A单击=返回列表  A长按连发=音量+  B单击=播放/暂停  B长按连发=音量-
+  bool up = false, down = false, volUp = false, volDn = false;
+  bool back = false, cfg = false;
+  bool enter = M5.BtnB.wasClicked();  // B 单击 = Enter（边沿触发）
+  {
+    static uint32_t aPressMs = 0, bPressMs = 0, aLast = 0, bLast = 0;
+    static bool     bCfgDone = false;
+    static uint32_t downUntil = 0, upUntil = 0, cfgUntil = 0;
+    const uint32_t  now = millis();
+    const bool      aOn = M5.BtnA.isPressed();
+    const bool      bOn = M5.BtnB.isPressed();
+    if (aOn && aPressMs == 0) { aPressMs = now; aLast = 0; }
+    if (bOn && bPressMs == 0) { bPressMs = now; bLast = 0; bCfgDone = false; }
+    if (!aOn) aPressMs = 0;
+    if (!bOn) bPressMs = 0;
+    const bool inPlayer = (view == VIEW_PLAYER);
+    if (M5.BtnA.wasClicked()) {              // A 单击
+      if (inPlayer) upUntil = now + 120;     //   播放页 -> 返回列表
+      else          downUntil = now + 120;   //   列表页 -> 下移
+    }
+    if (aOn && now - aPressMs >= 500) {      // A 长按（M5Unified hold 阈值同 500ms）
+      if (inPlayer) {                        //   播放页：音量+ 连发
+        if (now - aLast >= 250) { volUp = true; aLast = now; }
+      } else if (now - aLast >= 350) {       //   列表页：上移 连发
+        upUntil = now + 120; aLast = now;
+      }
+    }
+    if (bOn && now - bPressMs >= 500 && inPlayer) {  // B 长按：音量- 连发
+      if (now - bLast >= 250) { volDn = true; bLast = now; }
+    }
+    if (bOn && now - bPressMs >= 1500 && !inPlayer && !bCfgDone) {
+      cfgUntil = now + 120;  // 列表页 B 长按 1.5s：打开 WiFi 配网
+      bCfgDone = true;       // 配网返回后不重复触发，直到松手
+    }
+    down = now < downUntil;
+    up   = now < upUntil;
+    cfg  = now < cfgUntil;
+  }
+#else
   auto& kb = M5Cardputer.Keyboard;
   bool up    = kb.isKeyPressed(';') || kb.isKeyPressed('w');
   bool down  = kb.isKeyPressed('.') || kb.isKeyPressed('s');
@@ -822,6 +960,8 @@ static void handleKeys() {
   bool volDn = kb.isKeyPressed('-') || kb.isKeyPressed('_');
   bool back  = kb.isKeyPressed('`');
   bool enter = kb.keysState().enter;
+  bool cfg   = false;  // '0' 键在下方配网块里读取
+#endif
 
   if (back) {
     returnToLauncher();  // 不返回
@@ -885,9 +1025,11 @@ static void handleKeys() {
     uiDirty = true;
   }
 
-  // ---- 0：列表页打开 WiFi 配网热点 ----
+  // ---- 0（键盘）/ B长按1.5s（StickS3）：列表页打开 WiFi 配网热点 ----
   static bool lastCfg = false;
-  bool cfg = kb.isKeyPressed('0');
+#ifndef PODCAST_TARGET_STICKS3
+  cfg = kb.isKeyPressed('0');  // 无键盘目标在上方 A/B 手势层置位
+#endif
   if (cfg && !lastCfg && view == VIEW_LIST) {
     bool connected = openPortal();
     // 配网成功且还没有节目列表 -> 顺手拉取
@@ -895,6 +1037,7 @@ static void handleKeys() {
   }
   lastCfg = cfg;
 
+#ifndef PODCAST_TARGET_STICKS3
   // ---- Tab：频道切换页开关（Esc 键 M5Cardputer 键盘库不上报，用 Tab 代替）----
   static bool lastTab = false;
   bool tab = kb.isKeyPressed('\t');
@@ -908,6 +1051,7 @@ static void handleKeys() {
     uiDirty = true;
   }
   lastTab = tab;
+#endif  // !PODCAST_TARGET_STICKS3
 
   // ---- Enter（边沿触发，长按不连发）----
   // 频道页：Enter 确认切换；列表页：Enter 选中当前集 = 打开它的播放页
@@ -948,15 +1092,23 @@ static void handleKeys() {
 
 void setup() {
   auto cfg = M5.config();
-  // 板载扬声器/麦克风完全交给 ESP32-audioI2S（I2S_NUM_1）自己驱动；
+  // 板载扬声器/麦克风完全交给 ESP32-audioI2S 自己驱动；
   // M5Unified 只负责屏幕、板卡识别和内部 I2C 总线
   cfg.internal_spk = false;
   cfg.internal_mic = false;
+#ifdef PODCAST_TARGET_STICKS3
+  M5.begin(cfg);  // StickS3 由 M5Unified 运行时自动识别
+#else
   M5Cardputer.begin(cfg);
+#endif
 
   Serial.begin(115200);
-  auto& d = M5Cardputer.Display;
-  Serial.printf("[app] display %dx%d\n", (int)d.width(), (int)d.height());
+  auto& d = M5.Display;
+#ifdef PODCAST_TARGET_STICKS3
+  d.setRotation(1);  // 原生 135x240 竖屏 -> 转 240x135 横屏（与 Cardputer 同布局）
+#endif
+  Serial.printf("[app] display %dx%d resetReason=%d\n", (int)d.width(),
+                (int)d.height(), (int)esp_reset_reason());
 
   // 列表布局按实际屏幕高度计算（CardputerADV 画布 240x135）
   listTop = 20;
@@ -969,8 +1121,19 @@ void setup() {
   d.fillScreen(C_BG);
   d.setTextColor(C_TEXT, C_BG);
 
-  // ---- 频道装载：SD /channels.txt > NVS 缓存 > 编译期内嵌 ----
+  // ---- 频道装载 ----
   d.drawString("读取频道...", 2, 1);
+#ifdef PODCAST_TARGET_STICKS3
+  // StickS3 版：单频道写死，无 SD 卡 / 无频道切换（换台改顶部配置区常量）
+  {
+    ChannelEntry ce;
+    ce.name = STICKS3_CHANNEL_NAME;
+    ce.rss  = STICKS3_CHANNEL_RSS;
+    channels.push_back(ce);
+  }
+  Serial.println("[chan] built-in single channel");
+#else
+  // SD /channels.txt > NVS 缓存 > 编译期内嵌
   {
     sdSPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
     sdReady = SD.begin(PIN_SD_CS, sdSPI, 25000000);
@@ -1077,6 +1240,7 @@ void setup() {
       p.end();
     }
   }
+#endif  // !PODCAST_TARGET_STICKS3
 
   if (channels.empty()) {
     // 最终兜底：编译期内嵌频道表（channels.txt 缺失也能用）
@@ -1100,6 +1264,33 @@ void setup() {
   Serial.printf("[app] channel %d: %s\n", chanIdx,
                 channels[chanIdx].name.c_str());
 
+  // 崩溃取证：把上一次复位的原因显示在开机屏上（方便不上电脑定位死机病因）
+  // esp_reset_reason: 1=正常上电 2=软件重启 3=程序崩溃 4=中断看门狗 5=任务看门狗
+  //                   6=硬件看门狗 7=深睡唤醒 8=电压跌落(brownout)
+  {
+    esp_reset_reason_t r = esp_reset_reason();
+    const char* why;
+    switch (r) {
+      case ESP_RST_POWERON:   why = "正常上电";     break;
+      case ESP_RST_SW:        why = "软件重启";     break;
+      case ESP_RST_PANIC:     why = "程序崩溃!";    break;
+      case ESP_RST_INT_WDT:   why = "中断看门狗!";  break;
+      case ESP_RST_TASK_WDT:  why = "任务看门狗!";  break;
+      case ESP_RST_WDT:       why = "硬件看门狗!";  break;
+      case ESP_RST_DEEPSLEEP: why = "深睡唤醒";     break;
+      case ESP_RST_BROWNOUT:  why = "电压跌落!";    break;
+      default:                why = "未知复位";     break;
+    }
+    Serial.printf("[app] resetReason=%d heapNow=%u heapMin=%u\n", (int)r,
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
+    if (r != ESP_RST_POWERON && r != ESP_RST_DEEPSLEEP) {
+      d.fillRect(0, 18, d.width(), 16, C_BG);
+      d.setTextColor(C_TEXT, C_BG);
+      d.drawString(String("上次异常: ") + why, 2, 18);
+      delay(4000);  // 异常复位时停留 4 秒，保证能看清原因
+    }
+  }
+
   d.fillScreen(C_BG);
   d.setTextColor(C_TEXT, C_BG);
   d.drawString("连接WiFi...", 2, 1);
@@ -1111,7 +1302,10 @@ void setup() {
   wm.setConfigPortalTimeout(180);    // 无人操作 3 分钟自动关闭热点
   wm.setAPCallback([](WiFiManager*) { drawPortalScreen(); });
   wifiOk = wm.autoConnect(AP_NAME);
-  if (wifiOk) WiFi.setSleep(false);  // 在线串流需要稳定吞吐
+  if (wifiOk) {
+    WiFi.setSleep(false);           // 在线串流需要稳定吞吐
+    WiFi.setAutoReconnect(true);    // 路由器闪断后底层自动重连
+  }
   Serial.printf("[app] wifi %s\n", wifiOk ? "connected" : "FAILED");
 
   // 2) RSS 节目列表（ES8311 延迟到首次播放时初始化，需 I2S 时钟先运行）
@@ -1129,7 +1323,11 @@ void setup() {
 }
 
 void loop() {
+#ifdef PODCAST_TARGET_STICKS3
+  M5.update();  // 刷新 BtnA/BtnB 状态（供 wasClicked/isPressed）
+#else
   M5Cardputer.update();
+#endif
   handleKeys();
 
   // 喂解码器（暂停时内部直接返回）。EOF 检测：
@@ -1151,16 +1349,37 @@ void loop() {
     drawPlayerPage(false);
   }
 
-  // WiFi 断线自动重连（低频检查）
+  // 播放中每轮检查 WiFi：掉线立刻干净停流。
+  // 死 socket 上继续解码是"杂音几分钟后崩溃重启"的根源
+  if (audio.isRunning() && WiFi.status() != WL_CONNECTED) {
+    int sec = audio.getAudioCurrentTime();
+    audio.stopSong();
+    paused = false;
+    wifiDropPause = true;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "WiFi断开(已播%02d:%02d)，Enter重播",
+             sec / 60, sec % 60);
+    statusMsg = buf;
+    Serial.printf("[net] dropped while playing at %ds\n", sec);
+    uiDirty = true;
+  }
+
+  // WiFi 断线自动重连 + 堆内存观测（低频）
   static uint32_t lastWifiCheck = 0;
-  if (millis() - lastWifiCheck > 5000) {
+  if (millis() - lastWifiCheck > 3000) {
     lastWifiCheck = millis();
     bool ok = (WiFi.status() == WL_CONNECTED);
     if (!ok) WiFi.reconnect();
     if (ok != wifiOk) {
       wifiOk = ok;
+      if (ok && wifiDropPause && !audio.isRunning()) {
+        wifiDropPause = false;
+        statusMsg = "WiFi已恢复，Enter重播";
+      }
       uiDirty = true;
     }
+    Serial.printf("[net] wifi=%d heap=%u minHeap=%u\n", ok,
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
   }
 
   if (uiDirty) {

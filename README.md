@@ -1,8 +1,11 @@
 # PodcastPlayer
 
-M5Stack Cardputer ADV（ESP32-S3）掌上播客机：开机自动连网，从 RSS 拉取节目列表，串流播放 m4a/mp3，全键盘操作，黑白屏 UI + 自动生成的文字封面。
+M5Stack 掌上播客机（ESP32-S3）：开机自动连网，从 RSS 拉取节目列表，串流播放 m4a/mp3，黑白屏 UI + 自动生成的文字封面。**支持两个硬件目标**：
 
-![硬件](https://img.shields.io/badge/hardware-Cardputer%20ADV-black) ![框架](https://img.shields.io/badge/PlatformIO-Arduino--ESP32-orange)
+- **Cardputer ADV**：全键盘操作，SD 卡免烧录换频道
+- **StickS3**：双键手势操作，单频道写死（换频道改两行代码重编译）
+
+![硬件](https://img.shields.io/badge/hardware-Cardputer%20ADV%20%7C%20StickS3-black) ![框架](https://img.shields.io/badge/PlatformIO-Arduino--ESP32-orange)
 
 ## 功能
 
@@ -15,14 +18,16 @@ M5Stack Cardputer ADV（ESP32-S3）掌上播客机：开机自动连网，从 RS
 
 ## 硬件
 
-| 项 | 说明 |
-|---|---|
-| 设备 | M5Stack Cardputer ADV（ESP32-S3，无 PSRAM） |
-| 音频 | ES8311 Codec + I2S_NUM_1（BCLK 41 / WS 43 / DOUT 42），外放与 3.5mm 同响 |
-| 屏幕 | GC9A07 系列 SPI 屏，240x135 逻辑画布（M5GFX 自动适配） |
-| 存储 | SD 卡（SCK 40 / MISO 39 / MOSI 14 / CS 12），可选，仅用于 channels.txt |
+| 项 | Cardputer ADV | StickS3 |
+|---|---|---|
+| SoC | ESP32-S3（无 PSRAM） | ESP32-S3（8MB OPI PSRAM） |
+| 音频 | ES8311，I2S_NUM_1（BCLK 41 / WS 43 / DOUT 42），外放与 3.5mm 同响 | ES8311，I2S_NUM_0（BCLK 17 / WS 15 / DOUT 14 / MCLK 18），功放由 M5PM1 使能 |
+| 屏幕 | 240x135（M5GFX 自动适配） | 135x240 原生 + rotation 1 → 240x135 |
+| 输入 | 全键盘 | A 键（G11）/ B 键（G12）手势 |
+| 频道 | SD 卡 `channels.txt`，免烧录换台 | 编译期写死单频道 |
+| PSRAM | 无（输入环 12KB） | 有（音频缓冲宽裕） |
 
-## 按键
+## 按键（Cardputer ADV）
 
 | 键 | 列表页 | 播放页 | 频道页 |
 |---|---|---|---|
@@ -33,6 +38,15 @@ M5Stack Cardputer ADV（ESP32-S3）掌上播客机：开机自动连网，从 RS
 | `0` | WiFi 配网 | — | 重新扫描 |
 | `Tab` | 频道页 | — | 返回列表 |
 | `` ` `` | 退回 M5Launcher | 同左 | 同左 |
+
+## 按键（StickS3）
+
+| 手势 | 列表页 | 播放页 |
+|---|---|---|
+| A 单击 | 光标下移 | 返回列表 |
+| A 长按 | 光标上移（连发） | 音量 +（连发） |
+| B 单击 | 播放 | 暂停/续播 |
+| B 长按 1.5s | WiFi 配网热点 | 音量 −（连发） |
 
 ## 频道配置
 
@@ -49,13 +63,16 @@ XX播客|https://feed.xyzfm.space/xxxxxxxxxxxxxxxx
 
 ```bash
 cd podcast_player
-pio run -e cardputer-adv-podcast          # 编译
+pio run -e cardputer-adv-podcast          # Cardputer ADV
+pio run -e m5stick-s3-podcast             # StickS3
 pio run -e cardputer-adv-podcast -t monitor   # 串口日志（115200）
 ```
 
-产物自动复制到 `dist/PodcastPlayer.bin`。刷机：把 bin 拷进 SD 卡，用 M5Launcher 选择刷入（单应用镜像，不动 bootloader/分区表）；按 `` ` `` 随时返回 Launcher。
+产物自动复制到 `dist/`：Cardputer 为 `PodcastPlayer.bin`，StickS3 为 `PodcastPlayer_StickS3.bin`。刷机：把 bin 拷进 SD 卡，用 M5Launcher 选择刷入（单应用镜像，不动 bootloader/分区表）；Cardputer 按 `` ` `` 随时返回 Launcher。
 
 > Windows 中文用户名环境：`tools/pio_windows_compat.py` 已处理 SCons 响应文件编码问题，已挂到 pre 脚本，无需额外操作。
+>
+> 解码任务栈补丁：`tools/patch_audio_stack.py` 在编译前把 audioI2S 解码任务栈从 3300 提到 8192（AAC 解码调用链深，默认栈会溢出），对两个环境自动生效。
 
 ## 依赖
 
@@ -71,14 +88,16 @@ pio run -e cardputer-adv-podcast -t monitor   # 串口日志（115200）
 
 ```
 podcast_player/
-├── platformio.ini        # cardputer-adv-podcast 环境（依赖全 GitHub tag 固定）
-├── channels.txt          # 兜底频道表（编译时内嵌；正式用放 SD 卡）
+├── platformio.ini        # 两个环境：cardputer-adv-podcast / m5stick-s3-podcast
+├── channels.txt          # 兜底频道表（编译时内嵌；Cardputer 正式用放 SD 卡）
 ├── src/
-│   ├── main.cpp          # 全部应用逻辑
+│   ├── main.cpp          # 全部应用逻辑（PODCAST_TARGET_STICKS3 区分板级差异）
 │   └── channels.h        # gen_channels.py 自动生成，勿手改
 └── tools/
-    ├── gen_channels.py   # 预构建：channels.txt -> channels.h
-    ├── deploy_dist.py    # 后构建：firmware.bin -> dist/PodcastPlayer.bin
+    ├── gen_channels.py       # 预构建：channels.txt -> channels.h
+    ├── patch_audio_stack.py  # 预构建：audioI2S 解码任务栈 3300 -> 8192
+    ├── deploy_dist.py        # 后构建：firmware.bin -> dist/（按环境命名）
+    ├── serial_dump.py        # 调试：pyserial 串口监听落盘
     └── pio_windows_compat.py
 ```
 
