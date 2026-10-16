@@ -1,0 +1,14 @@
+# 频道表（tools/gen_channels.py 编译前自动读取生成内嵌兜底频道；
+# 正式使用时把同样格式放到 SD 卡根目录 channels.txt 即可免烧录换频道）
+#
+# 格式：每行一个频道，用竖线分隔：
+#   频道名|RSS地址
+#
+# 封面不需要任何图片：设备会按频道名自动生成文字封面
+# （每个频道一个专属配色的渐变徽章，同名永远同色）
+#
+# 示例：
+#   某某电台|https://example.com/feed.rss
+
+霓达播客|https://feed.xyzfm.space/xlgejk3wbj8q
+搞钱女孩|https://feed.xyzfm.space/qw7x9eum9utp

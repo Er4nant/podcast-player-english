@@ -1,0 +1,14 @@
+# 构建产物
+.pio/
+dist/
+
+# 旧版本备份（含历史固件，勿上传）
+backup/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
