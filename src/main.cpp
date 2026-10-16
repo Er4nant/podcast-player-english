@@ -135,6 +135,7 @@ static View view      = VIEW_LIST;  // 当前页面
 static int  chanIdx    = 0;         // 当前频道下标（NVS 持久化）
 static int  chanCursor = 0;         // 频道页光标
 static int  chanTop    = 0;         // 频道页滚动窗口顶部
+static bool refetchNeeded = false;  // 配网页改了 RSS，待重新拉取节目列表
 
 // ------------------------- 运行时频道表 -------------------------
 // 优先级：SD 卡 /channels.txt（免烧录改频道）> NVS 缓存 > 编译期内嵌。
@@ -310,6 +311,45 @@ static bool openPortal();        // 重新打开配网热点（列表页按 0）
 
 // --------------------- WiFi 配网（captive portal） ---------------------
 
+#ifdef PODCAST_TARGET_STICKS3
+// 配网页提交的频道参数 -> 更新运行时频道并写 NVS（免烧录换台）。
+// 返回 RSS 是否变化（需要重新拉取节目列表）。
+//   - 改成新的 http(s) 地址：保存到 NVS
+//   - 清空 RSS 字段：清除 NVS，恢复固件内置频道
+//   - 其余情况（未改 / 非 http 开头）：忽略
+static bool applyPortalChannel(const char* name, const char* rss) {
+  String newName(name), newRss(rss);
+  newName.trim();
+  newRss.trim();
+  String cur(channels[0].rss.c_str());
+  Preferences p;
+  bool changed = false;
+  if (newRss.length() == 0) {
+    if (cur != STICKS3_CHANNEL_RSS) {  // 清空 = 恢复内置频道
+      p.begin("stickchan", false);
+      p.clear();
+      p.end();
+      channels[0].name = STICKS3_CHANNEL_NAME;
+      channels[0].rss  = STICKS3_CHANNEL_RSS;
+      changed = true;
+      Serial.println("[chan] restored built-in channel");
+    }
+  } else if (newRss != cur && newRss.startsWith("http")) {
+    p.begin("stickchan", false);
+    p.putString("rss", newRss);
+    p.putString("name", newName.length() ? newName
+                                         : String(STICKS3_CHANNEL_NAME));
+    p.end();
+    channels[0].name = newName.length() ? newName.c_str()
+                                        : STICKS3_CHANNEL_NAME;
+    channels[0].rss  = newRss.c_str();
+    changed = true;
+    Serial.printf("[chan] custom channel saved: %s\n", newRss.c_str());
+  }
+  return changed;
+}
+#endif
+
 // 配网说明页：手机连接设备热点后，DNS 劫持会自动弹出配置页；
 // setAPCallback 在热点就绪时由 WiFiManager 调用
 static void drawPortalScreen() {
@@ -320,11 +360,15 @@ static void drawPortalScreen() {
   d.setTextColor(C_ACCENT, C_BG);
   d.drawString("WiFi 配置", 2, 4);
   d.setTextColor(C_TEXT, C_BG);
-  d.drawString("1.手机WiFi连接热点", 2, 30);
-  d.drawString("  PodcastPlayer", 2, 50);
-  d.drawString("2.自动弹出配置页", 2, 70);
-  d.drawString("  或访问 192.168.4.1", 2, 90);
-  d.drawString("3.选择家中WiFi输密码", 2, 110);
+  d.drawString("1.手机连接热点", 2, 26);
+  d.drawString("   PodcastPlayer", 2, 44);
+  d.drawString("2.弹出页(192.168.4.1)", 2, 62);
+#ifdef PODCAST_TARGET_STICKS3
+  d.drawString("3.选WiFi并输密码", 2, 80);
+  d.drawString("4.同页可改播客RSS", 2, 98);
+#else
+  d.drawString("3.选择家中WiFi输密码", 2, 98);
+#endif
 }
 
 // 打开配网热点（阻塞）：WiFiManager 内部跑 webserver + DNS，直到连上
@@ -335,12 +379,26 @@ static bool openPortal() {
   wm.setConnectTimeout(10);        // 已存凭据的连接尝试等待
   wm.setConfigPortalTimeout(180);  // 无人操作 3 分钟自动关闭热点
   wm.setAPCallback([](WiFiManager*) { drawPortalScreen(); });
+#ifdef PODCAST_TARGET_STICKS3
+  // 配网页附带频道设置：预填当前生效频道，改完保存即换台（存 NVS，
+  // 免烧录）。清空 RSS 字段保存 = 恢复固件内置频道
+  WiFiManagerParameter prmName("chan", "频道名", channels[0].name.c_str(), 48);
+  WiFiManagerParameter prmRss("rss", "播客RSS地址",
+                              channels[0].rss.c_str(), 256);
+  wm.addParameter(&prmName);
+  wm.addParameter(&prmRss);
+#endif
   bool ok = wm.startConfigPortal(AP_NAME);
   wifiOk = ok && (WiFi.status() == WL_CONNECTED);
   if (wifiOk) {
     WiFi.setSleep(false);           // 在线串流需要稳定吞吐
     WiFi.setAutoReconnect(true);    // 路由器闪断后底层自动重连
   }
+#ifdef PODCAST_TARGET_STICKS3
+  if (applyPortalChannel(prmName.getValue(), prmRss.getValue())) {
+    refetchNeeded = true;  // loop 顶部触发重新拉取新频道
+  }
+#endif
   uiDirty = true;                    // 恢复主界面（loop 里重绘）
   return wifiOk;
 }
@@ -1138,6 +1196,11 @@ static void handleKeys() {
 // --------------------------- 主流程 ---------------------------
 
 void setup() {
+#ifdef PODCAST_TARGET_STICKS3
+  // CPU 240 -> 160MHz：AAC 解码余量充足，显著降低发热与功耗
+  // （连续播放时整机过烫）。放在 M5.begin 之前，全程生效
+  setCpuFrequencyMhz(160);
+#endif
   auto cfg = M5.config();
   // 板载扬声器/麦克风完全交给 ESP32-audioI2S 自己驱动；
   // M5Unified 只负责屏幕、板卡识别和内部 I2C 总线
@@ -1171,14 +1234,26 @@ void setup() {
   // ---- 频道装载 ----
   d.drawString("读取频道...", 2, 1);
 #ifdef PODCAST_TARGET_STICKS3
-  // StickS3 版：单频道写死，无 SD 卡 / 无频道切换（换台改顶部配置区常量）
+  // StickS3 版：单频道。优先用配网页保存的自定义频道（NVS，免烧录
+  // 换台），没有则用固件内置频道。配网页改 RSS 见 applyPortalChannel
   {
     ChannelEntry ce;
-    ce.name = STICKS3_CHANNEL_NAME;
-    ce.rss  = STICKS3_CHANNEL_RSS;
+    Preferences p;
+    p.begin("stickchan", true);
+    String nvsRss   = p.getString("rss", "");
+    String nvsName  = p.getString("name", "");
+    p.end();
+    if (nvsRss.length() > 0) {
+      ce.name = nvsName.length() ? nvsName.c_str() : STICKS3_CHANNEL_NAME;
+      ce.rss  = nvsRss.c_str();
+      Serial.printf("[chan] custom channel from NVS: %s\n", ce.rss.c_str());
+    } else {
+      ce.name = STICKS3_CHANNEL_NAME;
+      ce.rss  = STICKS3_CHANNEL_RSS;
+      Serial.println("[chan] built-in single channel");
+    }
     channels.push_back(ce);
   }
-  Serial.println("[chan] built-in single channel");
 #else
   // SD /channels.txt > NVS 缓存 > 编译期内嵌
   {
@@ -1348,11 +1423,24 @@ void setup() {
   wm.setConnectTimeout(10);          // 已存凭据的连接尝试等待
   wm.setConfigPortalTimeout(180);    // 无人操作 3 分钟自动关闭热点
   wm.setAPCallback([](WiFiManager*) { drawPortalScreen(); });
+#ifdef PODCAST_TARGET_STICKS3
+  // 配网页附带频道设置（首次开机时用户可顺手填自己的 RSS）
+  WiFiManagerParameter prmName("chan", "频道名", channels[0].name.c_str(), 48);
+  WiFiManagerParameter prmRss("rss", "播客RSS地址",
+                              channels[0].rss.c_str(), 256);
+  wm.addParameter(&prmName);
+  wm.addParameter(&prmRss);
+#endif
   wifiOk = wm.autoConnect(AP_NAME);
   if (wifiOk) {
     WiFi.setSleep(false);           // 在线串流需要稳定吞吐
     WiFi.setAutoReconnect(true);    // 路由器闪断后底层自动重连
   }
+#ifdef PODCAST_TARGET_STICKS3
+  // 首次配置时若顺手改了 RSS：channels[0] 已更新，下方首次拉取即用新源
+  applyPortalChannel(prmName.getValue(), prmRss.getValue());
+  refetchNeeded = false;  // setup 尾部本来就会拉取，无需额外触发
+#endif
   Serial.printf("[app] wifi %s\n", wifiOk ? "connected" : "FAILED");
 
   // 2) RSS 节目列表（ES8311 延迟到首次播放时初始化，需 I2S 时钟先运行）
@@ -1376,6 +1464,14 @@ void loop() {
   M5Cardputer.update();
 #endif
   handleKeys();
+#ifdef PODCAST_TARGET_STICKS3
+  // 配网页改了 RSS：回到列表后重新拉取新频道的节目
+  if (refetchNeeded && !audio.isRunning()) {
+    refetchNeeded = false;
+    view = VIEW_LIST;
+    fetchWithProgress();
+  }
+#endif
   ampTick();  // 延时使能功放 + 音量淡入（欠压规避）
 
   // 喂解码器（暂停时内部直接返回）。EOF 检测：

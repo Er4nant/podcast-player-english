@@ -3,7 +3,7 @@
 M5Stack 掌上播客机（ESP32-S3）：开机自动连网，从 RSS 拉取节目列表，串流播放 m4a/mp3，黑白屏 UI + 自动生成的文字封面。**支持两个硬件目标**：
 
 - **Cardputer ADV**：全键盘操作，SD 卡免烧录换频道
-- **StickS3**：双键手势操作，单频道写死（换频道改两行代码重编译）
+- **StickS3**：双键手势操作，配网页直接改 RSS（免烧录换台）
 
 ![硬件](https://img.shields.io/badge/hardware-Cardputer%20ADV%20%7C%20StickS3-black) ![框架](https://img.shields.io/badge/PlatformIO-Arduino--ESP32-orange)
 
@@ -24,8 +24,9 @@ M5Stack 掌上播客机（ESP32-S3）：开机自动连网，从 RSS 拉取节�
 | 音频 | ES8311，I2S_NUM_1（BCLK 41 / WS 43 / DOUT 42），外放与 3.5mm 同响 | ES8311，I2S_NUM_0（BCLK 17 / WS 15 / DOUT 14 / MCLK 18），功放由 M5PM1 使能 |
 | 屏幕 | 240x135（M5GFX 自动适配） | 135x240 原生 + rotation 1 → 240x135 |
 | 输入 | 全键盘 | A 键（G11）/ B 键（G12）手势 |
-| 频道 | SD 卡 `channels.txt`，免烧录换台 | 编译期写死单频道 |
+| 频道 | SD 卡 `channels.txt`，免烧录换台 | 配网页改 RSS（存 NVS），免烧录换台 |
 | PSRAM | 无（输入环 12KB） | 有（音频缓冲宽裕） |
+| CPU | 240MHz | 160MHz（降发热，AAC 解码余量充足） |
 
 ## 按键（Cardputer ADV）
 
@@ -50,7 +51,7 @@ M5Stack 掌上播客机（ESP32-S3）：开机自动连网，从 RSS 拉取节�
 
 ## 频道配置
 
-SD 卡根目录放 `channels.txt`（UTF-8，`#` 开头为注释行）：
+**Cardputer ADV**：SD 卡根目录放 `channels.txt`（UTF-8，`#` 开头为注释行）：
 
 ```
 # 格式：频道名|RSS地址
@@ -58,6 +59,8 @@ XX播客|https://feed.xyzfm.space/xxxxxxxxxxxxxxxx
 ```
 
 封面自动生成，不需要图片。不加 SD 卡也能用：仓库里的 `channels.txt` 会在编译时内嵌为兜底频道表。
+
+**StickS3**：列表页 B 键长按 1.5 秒开配网热点，手机连接 `PodcastPlayer` 后在弹出的配置页里直接修改「频道名」和「播客RSS地址」，保存后自动拉取新频道（存在设备 NVS 里，重启不丢）。把 RSS 框清空再保存 = 恢复固件内置频道。
 
 ## 编译
 
