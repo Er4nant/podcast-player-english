@@ -40,8 +40,7 @@ SD 卡根目录放 `channels.txt`（UTF-8，`#` 开头为注释行）：
 
 ```
 # 格式：频道名|RSS地址
-霓达播客|https://feed.xyzfm.space/xlgejk3wbj8q
-搞钱女孩|https://feed.xyzfm.space/qw7x9eum9utp
+XX播客|https://feed.xyzfm.space/xxxxxxxxxxxxxxxx
 ```
 
 封面自动生成，不需要图片。不加 SD 卡也能用：仓库里的 `channels.txt` 会在编译时内嵌为兜底频道表。
