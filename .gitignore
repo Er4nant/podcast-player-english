@@ -15,3 +15,6 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+
+# Hidden features: never commit
+src/eggs_private.h

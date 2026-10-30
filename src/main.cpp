@@ -1681,7 +1681,10 @@ static void termChannels(const std::string& arg) {
   termPrint("channel: " + channels[chanIdx].name + " (" + std::to_string(episodes.size()) + " episodes)");
 }
 
+#include "eggs.h"  // hidden features (private file is gitignored; public build uses the stub)
+
 static void termExec(const std::string& raw) {
+  if (eggWantsSecret()) { eggSecret(raw); return; }  // sudo password: never echoed, never logged
   // trim
   size_t b = raw.find_first_not_of(" \t");
   if (b == std::string::npos) return;
@@ -1765,6 +1768,7 @@ static void termExec(const std::string& raw) {
     if (connected && episodes.empty()) fetchWithProgress();
     termPrint(connected ? "wi-fi connected" : "wi-fi not set up", connected ? 0 : 2);
   }
+  else if (eggCommand(cmd, a, rest)) {}
   else termPrint("unknown command: /" + cmd + "  (try /help)", 2);
 }
 
@@ -2404,6 +2408,9 @@ void loop() {
     view = VIEW_LIST;
     fetchWithProgress();
   }
+#endif
+#ifndef PODCAST_TARGET_STICKS3
+  eggTick(audio.isRunning() && !paused);
 #endif
   ampTick();  // delayed amp enable + volume fade-in (brownout avoidance)
 
