@@ -133,6 +133,7 @@ struct Episode {
 static std::vector<Episode> episodes;
 // Show discovery (charts / search). A show loaded from there overrides the channel RSS
 // until the user switches channel. Empty activeFeedUrl = use the channel's RSS.
+extern const uint8_t _binary_x509_crt_bundle_start[];  // IDF CA bundle (libmbedtls)
 static std::string activeFeedUrl;
 static std::string activeFeedName;
 
@@ -615,6 +616,144 @@ static void ampTick() {
 
 // --------------------------- Playback control ---------------------------
 
+// ----------------------- Episode downloads (SD card) -----------------------
+// Episodes can be saved to /podcasts/<feed-hash>/<episode-hash>.<ext> on the SD card.
+// Local files can be seeked (±30 s keys); streamed episodes cannot (audioI2S only seeks files).
+static bool autoDownload = true;   // 'g' toggles; when on, Enter downloads before playing
+static bool playingLocal = false;  // current playback comes from the SD card
+
+static std::string podcastDirFor() {
+  std::string feed = activeFeedUrl.empty() ? std::string(channels[chanIdx].rss) : activeFeedUrl;
+  char buf[24];
+  snprintf(buf, sizeof(buf), "/podcasts/%08X", (unsigned)nameHash(feed));
+  return buf;
+}
+
+static std::string localPathFor(const Episode& ep) {
+  std::string u = ep.url;
+  size_t q = u.find_first_of("?#");
+  if (q != std::string::npos) u.resize(q);
+  std::string ext = ".mp3";  // audioI2S picks the decoder from the extension
+  if (u.size() >= 4 && (u.compare(u.size() - 4, 4, ".m4a") == 0 || u.compare(u.size() - 4, 4, ".aac") == 0)) ext = ".m4a";
+  char name[16];
+  snprintf(name, sizeof(name), "%08X", (unsigned)nameHash(ep.url));
+  return podcastDirFor() + "/" + name + ext;
+}
+
+static bool hasLocalCopy(const Episode& ep) {
+  return sdReady && SD.exists(localPathFor(ep).c_str());
+}
+
+// Stream the episode to SD. Blocking; updates the status bar about once a second.
+// Writes to a .part file first so an interrupted download never looks complete.
+static bool downloadEpisode(int idx) {
+  if (!sdReady) { statusMsg = "No SD card"; return false; }
+  if (idx < 0 || idx >= (int)episodes.size()) return false;
+  if (hasLocalCopy(episodes[idx])) return true;
+  if (audio.isRunning()) { audio.stopSong(); while (audio.isRunning()) delay(10); }
+
+  std::string url = episodes[idx].url;
+  std::string finalPath = localPathFor(episodes[idx]);
+  std::string partPath  = finalPath + ".part";
+  SD.mkdir("/podcasts");
+  SD.mkdir(podcastDirFor().c_str());
+
+  WiFiClientSecure secure;
+  WiFiClient       plain;
+  HTTPClient       http;
+  bool isHttps = url.rfind("https://", 0) == 0;
+  if (isHttps) secure.setCACertBundle(_binary_x509_crt_bundle_start);
+  bool began = isHttps ? http.begin(secure, url.c_str()) : http.begin(plain, url.c_str());
+  if (!began) { statusMsg = "Download: bad URL"; return false; }
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setUserAgent("CardputerPodcast/1.0");
+  http.setConnectTimeout(10000);
+  http.setTimeout(15000);
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("[dl] HTTP %d\n", code);
+    http.end();
+    statusMsg = "Download failed (HTTP " + std::to_string(code) + ")";
+    return false;
+  }
+  int total = http.getSize();  // -1 when the server sends chunked data
+  WiFiClient* stream = http.getStreamPtr();
+  File out = SD.open(partPath.c_str(), FILE_WRITE);
+  if (!out || stream == nullptr) {
+    http.end();
+    statusMsg = "Download: SD write failed";
+    return false;
+  }
+
+  static uint8_t buf[4096];
+  size_t done = 0;
+  uint32_t lastUi = 0, lastData = millis();
+  while (http.connected() && (total < 0 || done < (size_t)total)) {
+    int avail = stream->available();
+    if (avail > 0) {
+      int n = stream->readBytes(buf, (size_t)min(avail, (int)sizeof(buf)));
+      if (n <= 0) break;
+      out.write(buf, (size_t)n);
+      done += (size_t)n;
+      lastData = millis();
+    } else {
+      if (millis() - lastData > 15000) break;  // stalled
+      delay(1);
+    }
+    if (millis() - lastUi >= 1000) {
+      char msg[48];
+      if (total > 0) snprintf(msg, sizeof(msg), "DL %u/%u MB",
+                              (unsigned)(done >> 20), (unsigned)(total >> 20));
+      else           snprintf(msg, sizeof(msg), "DL %u MB", (unsigned)(done >> 20));
+      statusMsg = msg;
+      drawUI();
+      lastUi = millis();
+    }
+  }
+  out.close();
+  http.end();
+
+  bool complete = done > 0 && (total < 0 || done == (size_t)total);
+  if (!complete) {
+    SD.remove(partPath.c_str());
+    statusMsg = "Download incomplete";
+    return false;
+  }
+  SD.remove(finalPath.c_str());
+  if (!SD.rename(partPath.c_str(), finalPath.c_str())) {
+    SD.remove(partPath.c_str());
+    statusMsg = "Download: rename failed";
+    return false;
+  }
+  Serial.printf("[dl] saved %u bytes -> %s\n", (unsigned)done, finalPath.c_str());
+  return true;
+}
+
+// 'x' key: delete the local copy of the selected episode (not while it is playing from the card).
+static void deleteLocalCopy(int idx) {
+  if (idx < 0 || idx >= (int)episodes.size()) return;
+  if (!hasLocalCopy(episodes[idx])) { statusMsg = "Not downloaded"; return; }
+  if (player.current == idx && playingLocal && audio.isRunning()) {
+    statusMsg = "Stop playback before deleting";
+    return;
+  }
+  SD.remove(localPathFor(episodes[idx]).c_str());
+  SD.rmdir(podcastDirFor().c_str());  // only succeeds if the show folder is now empty
+  statusMsg = "Deleted download";
+  uiDirty = true;
+}
+
+// ',' / '/' keys: jump back or forward 30 s. Local files only.
+static void skipSeconds(int sec) {
+  if (!playingLocal || !audio.isRunning()) {
+    statusMsg = "Skip needs a downloaded episode";
+    uiDirty = true;
+    return;
+  }
+  audio.setTimeOffset(sec);
+  uiDirty = true;
+}
+
 static void startPlayback(int idx) {
   if (audio.isRunning()) audio.stopSong();
   paused = false;
@@ -624,6 +763,19 @@ static void startPlayback(int idx) {
   // staggered from the DNS+TLS+first-block download WiFi current spike, avoiding a brownout reboot
   setAmp(false);
   ampFadeNow = 0;
+
+  // Decide source: SD copy if present; otherwise download first when auto-download is on
+  bool local = hasLocalCopy(episodes[idx]);
+  if (!local && autoDownload && sdReady) {
+    if (!downloadEpisode(idx)) {
+      playingLocal = false;
+      view = VIEW_PLAYER;
+      uiDirty = true;
+      return;
+    }
+    local = true;
+  }
+  playingLocal = local;
 
   // connecttohost blocks synchronously for seconds (DNS+TLS+GET+m4a header parse); draw the hint first
   statusMsg = "Buffering...";
@@ -654,7 +806,8 @@ static void startPlayback(int idx) {
   uint32_t t0 = millis();
   Serial.printf("[audio] startPlayback idx=%d heap=%u\n", idx,
                 (unsigned)ESP.getFreeHeap());
-  bool ok = audio.connecttohost(episodes[idx].url.c_str());
+  bool ok = local ? audio.connecttoFS(SD, localPathFor(episodes[idx]).c_str())
+                  : audio.connecttohost(episodes[idx].url.c_str());
   Serial.printf("[audio] connecttohost returned ok=%d after %ums\n",
                 (int)ok, (unsigned)(millis() - t0));
   if (ok && !es8311Ready) {
@@ -1432,6 +1585,36 @@ static void handleKeys() {
   bool keyC = kb.isKeyPressed('c');
   bool keyF = kb.isKeyPressed('f');
   if (keyC && !lastC && view == VIEW_LIST) openCharts();
+  static bool lastD = false, lastX = false, lastG = false;
+  bool keyD = kb.isKeyPressed('d');
+  bool keyX = kb.isKeyPressed('x');
+  bool keyG = kb.isKeyPressed('g');
+  if (view == VIEW_LIST && keyD && !lastD && !episodes.empty()) {
+    if (downloadEpisode(cursor)) statusMsg = "Downloaded";
+    uiDirty = true;
+  }
+  if (view == VIEW_LIST && keyX && !lastX && !episodes.empty()) deleteLocalCopy(cursor);
+  if (view == VIEW_LIST && keyG && !lastG) {
+    autoDownload = !autoDownload;
+    Preferences p;
+    p.begin("app", false);
+    p.putBool("autodl", autoDownload);
+    p.end();
+    statusMsg = autoDownload ? "Auto-download: on" : "Auto-download: off";
+    uiDirty = true;
+  }
+  lastD = keyD;
+  lastX = keyX;
+  lastG = keyG;
+
+  static bool lastSkipBack = false, lastSkipFwd = false;
+  bool keySkipBack = kb.isKeyPressed(',');
+  bool keySkipFwd  = kb.isKeyPressed('/');
+  if (view == VIEW_PLAYER && keySkipBack && !lastSkipBack) skipSeconds(-30);
+  if (view == VIEW_PLAYER && keySkipFwd && !lastSkipFwd) skipSeconds(30);
+  lastSkipBack = keySkipBack;
+  lastSkipFwd = keySkipFwd;
+
   static bool lastO = false;
   bool keyO = kb.isKeyPressed('o');
   if (keyO && !lastO && view == VIEW_LIST) toggleEpisodeOrder();
@@ -1566,6 +1749,12 @@ void setup() {
     sdSPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
     sdReady = SD.begin(PIN_SD_CS, sdSPI, 25000000);
     Serial.printf("[sd] %s\n", sdReady ? "mounted" : "not found");
+    {
+      Preferences p;
+      p.begin("app", true);
+      autoDownload = p.getBool("autodl", true);
+      p.end();
+    }
   }
 
   bool fromSD = false;
