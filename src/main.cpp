@@ -117,13 +117,13 @@ static constexpr uint8_t  VOLUME_DEFAULT = 12;
 // =================================================================
 
 // ------------------------ Colors (black/white/gray; only cover art is color) ------------------------
-static constexpr uint16_t C_BG      = 0x0000;  // pure black background
-static constexpr uint16_t C_ACCENT  = 0xFFFF;  // accent = white (title/progress bar/cursor/cover frame)
-static constexpr uint16_t C_BAR_BG  = 0x2104;  // progress bar track = dark gray
-static constexpr uint16_t C_SELECT  = 0x2104;  // list selected-row background = dark gray
-static constexpr uint16_t C_TEXT    = 0xFFFF;  // body text white
-static constexpr uint16_t C_DIM     = 0x7BEF;  // secondary gray
-static constexpr uint16_t C_WARN    = 0xFFFF;  // alert = white (black-and-white theme)
+static uint16_t C_BG      = 0x0000;  // pure black background
+static uint16_t C_ACCENT  = 0xFFFF;  // accent = white (title/progress bar/cursor/cover frame)
+static uint16_t C_BAR_BG  = 0x2104;  // progress bar track = dark gray
+static uint16_t C_SELECT  = 0x2104;  // list selected-row background = dark gray
+static uint16_t C_TEXT    = 0xFFFF;  // body text white
+static uint16_t C_DIM     = 0x7BEF;  // secondary gray
+static uint16_t C_WARN    = 0xFFFF;  // alert = white (black-and-white theme)
 
 // --------------------------- Global state ---------------------------
 struct Episode {
@@ -1406,7 +1406,440 @@ static void drawChannelPage() {
   d.drawString("w/s:sel Enter:ok Tab:back", 2, d.height() - 17);
 }
 
+static void returnToLauncher();  // defined below (M5Launcher exit)
+// ============================ Terminal UI (Cardputer) ============================
+// Everything on the Cardputer is driven from a command line. Plain text runs /search.
+// The StickS3 keeps its two-button views and never reaches this code.
+#ifndef PODCAST_TARGET_STICKS3
+struct Theme {
+  const char* name;
+  uint16_t bg, accent, text, dim, select;
+};
+static constexpr uint16_t RGB565(uint8_t r, uint8_t g, uint8_t b) {
+  return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+static const Theme THEMES[] = {
+    {"crimson", RGB565(0, 0, 0), RGB565(220, 20, 60),  RGB565(250, 236, 236), RGB565(140, 70, 80),  RGB565(70, 0, 16)},
+    {"ember",   RGB565(0, 0, 0), RGB565(255, 80, 40),  RGB565(255, 240, 230), RGB565(150, 80, 60),  RGB565(80, 16, 0)},
+    {"rose",    RGB565(0, 0, 0), RGB565(255, 105, 140), RGB565(255, 240, 245), RGB565(150, 90, 105), RGB565(90, 20, 35)},
+    {"mono",    RGB565(0, 0, 0), 0xFFFF,               0xFFFF,                0x7BEF,                 0x2104},
+};
+static const int THEME_COUNT = sizeof(THEMES) / sizeof(THEMES[0]);
+static int themeIdx = 0;
+static int skipSec  = 30;          // /skip default and step
+static const int TERM_LOG_MAX  = 200;
+static const size_t TERM_INPUT_MAX = 120;
+static const int TERM_ROWS = 6;    // log rows between the status bar and the prompt
+static const int TERM_STATUS_H = 16;
+
+struct TermLine {
+  std::string text;
+  uint8_t     kind;  // 0 normal, 1 dim, 2 error/echo
+};
+static std::vector<TermLine> termLog;
+static std::string termInput;
+
+static void applyTheme(int idx) {
+  if (idx < 0 || idx >= THEME_COUNT) idx = 0;
+  themeIdx = idx;
+  C_BG     = THEMES[idx].bg;
+  C_ACCENT = THEMES[idx].accent;
+  C_TEXT   = THEMES[idx].text;
+  C_DIM    = THEMES[idx].dim;
+  C_SELECT = THEMES[idx].select;
+  C_BAR_BG = THEMES[idx].select;
+  uiDirty  = true;
+}
+
+static void termPrint(const std::string& text, uint8_t kind = 0) {
+  size_t start = 0;
+  while (true) {
+    size_t nl = text.find('\n', start);
+    termLog.push_back({text.substr(start, nl == std::string::npos ? std::string::npos : nl - start), kind});
+    if (nl == std::string::npos) break;
+    start = nl + 1;
+  }
+  if ((int)termLog.size() > TERM_LOG_MAX) termLog.erase(termLog.begin(), termLog.begin() + (termLog.size() - TERM_LOG_MAX));
+  uiDirty = true;
+}
+
+// Persist settings to NVS (namespace "app").
+static void saveSettings() {
+  Preferences p;
+  p.begin("app", false);
+  p.putBool("autodl", autoDownload);
+  p.putUChar("skip", (uint8_t)skipSec);
+  p.putUChar("theme", (uint8_t)themeIdx);
+  p.putUChar("vol", player.volume);
+  p.end();
+}
+
+static void loadSettings() {
+  Preferences p;
+  p.begin("app", true);
+  autoDownload = p.getBool("autodl", true);
+  skipSec      = p.getUChar("skip", 30);
+  themeIdx     = p.getUChar("theme", 0);
+  player.volume = p.getUChar("vol", VOLUME_DEFAULT);
+  p.end();
+  if (skipSec < 5 || skipSec > 300) skipSec = 30;
+  if (player.volume > VOLUME_MAX) player.volume = VOLUME_DEFAULT;
+  applyTheme(themeIdx);
+}
+
+// ---- command implementations ----
+static void termHelp() {
+  termPrint("commands:");
+  termPrint("  /help              this list");
+  termPrint("  /list              episodes in this feed");
+  termPrint("  /play [n]          play episode n (default: selected)");
+  termPrint("  /pause             pause or resume");
+  termPrint("  /stop              stop playback");
+  termPrint("  /next  /prev       next or previous episode");
+  termPrint("  /skip [+-sec]      jump in a downloaded episode");
+  termPrint("  /status            playback position and stats");
+  termPrint("  /vol [0-16]        show or set volume");
+  termPrint("  /chan [n]          list or switch channel");
+  termPrint("  /charts            top podcasts (AU)");
+  termPrint("  /search <term>     find podcasts (plain text too)");
+  termPrint("  /open <n>          load a show from the last list");
+  termPrint("  /download [n]      save episode to SD");
+  termPrint("  /rm [n]            delete saved episode");
+  termPrint("  /order             flip newest/oldest");
+  termPrint("  /settings          show settings");
+  termPrint("  /set <key> <val>   autodl on|off, skip <sec>, theme <name>");
+  termPrint("  /theme [name]      list or set theme");
+  termPrint("  /wifi              Wi-Fi setup hotspot");
+  termPrint("  /clear             clear this log");
+  termPrint("  /quit              back to launcher");
+}
+
+static void termShowEpisodes() {
+  if (episodes.empty()) { termPrint("no episodes loaded (try /chan or /open)", 1); return; }
+  for (int i = 0; i < (int)episodes.size(); ++i) {
+    char mark = (i == player.current) ? '*' : ' ';
+    std::string local = hasLocalCopy(episodes[i]) ? " [dl]" : "";
+    char num[8];
+    snprintf(num, sizeof(num), "%c%2d ", mark, i + 1);
+    termPrint(std::string(num) + episodes[i].title + local, i == player.current ? 2 : 0);
+  }
+  if (episodesOldestFirst) termPrint("(oldest first)", 1);
+}
+
+static void termShowShows() {
+  if (shows.empty()) { termPrint("no results", 1); return; }
+  for (int i = 0; i < (int)shows.size(); ++i) {
+    char num[8];
+    snprintf(num, sizeof(num), " %2d ", i + 1);
+    std::string line = std::string(num) + shows[i].name;
+    if (!shows[i].artist.empty()) line += " - " + shows[i].artist;
+    termPrint(line);
+  }
+  termPrint("use /open <n> to load one", 1);
+}
+
+static void termPlay(int idx) {
+  if (idx < 0 || idx >= (int)episodes.size()) { termPrint("no such episode", 2); return; }
+  termPrint("loading " + episodes[idx].title, 1);
+  startPlayback(idx);
+  if (audio.isRunning()) {
+    termPrint("playing " + std::to_string(idx + 1) + ": " + episodes[idx].title);
+  } else {
+    termPrint(statusMsg.empty() ? std::string("playback failed") : statusMsg, 2);
+  }
+}
+
+static void termStatus() {
+  if (player.current < 0 || player.current >= (int)episodes.size()) { termPrint("nothing playing", 1); return; }
+  uint32_t t = audio.getAudioCurrentTime();
+  uint32_t total = audio.getAudioFileDuration();
+  char buf[96];
+  termPrint(episodes[player.current].title);
+  if (total > 0) {
+    int left = (int)((total > t ? total - t : 0) * 100 / total);
+    snprintf(buf, sizeof(buf), "%02u:%02u / %02u:%02u  %d%% left",
+             (unsigned)(t / 60), (unsigned)(t % 60), (unsigned)(total / 60), (unsigned)(total % 60), left);
+  } else {
+    snprintf(buf, sizeof(buf), "%02u:%02u / --:--", (unsigned)(t / 60), (unsigned)(t % 60));
+  }
+  termPrint(buf);
+  snprintf(buf, sizeof(buf), "%s  %s  %u kbps  vol %d",
+           playingLocal ? "local" : "stream", audio.getCodecname(),
+           (unsigned)(audio.getBitRate(true) / 1000), player.volume);
+  termPrint(buf, 1);
+  termPrint(paused ? "state: paused" : (audio.isRunning() ? "state: playing" : "state: stopped"), 1);
+}
+
+static void termPauseToggle() {
+  if (!audio.isRunning() && !paused) { termPrint("nothing playing", 1); return; }
+  if (paused) {
+    audio.pauseResume();
+    paused = false;
+    audio.loop();
+    termPrint("resumed");
+    if (!audio.isRunning()) termPrint("link dropped, /play to replay", 2);
+  } else {
+    audio.pauseResume();
+    paused = true;
+    termPrint("paused");
+  }
+}
+
+static void termStop() {
+  if (audio.isRunning()) {
+    audio.stopSong();
+    while (audio.isRunning()) delay(10);
+  }
+  paused = false;
+  playingLocal = false;
+  player.current = -1;
+  termPrint("stopped");
+}
+
+static void termSkip(const std::string& arg) {
+  int sec = skipSec;
+  if (!arg.empty()) sec = atoi(arg.c_str());
+  if (sec == 0) { termPrint("usage: /skip -30 or /skip 30", 2); return; }
+  if (!playingLocal || !audio.isRunning()) { termPrint("skip needs a downloaded episode playing", 2); return; }
+  audio.setTimeOffset(sec);
+  termPrint(std::string("skipped ") + (sec > 0 ? "+" : "") + std::to_string(sec) + "s");
+}
+
+static void termVolume(const std::string& arg) {
+  if (arg.empty()) { termPrint("volume " + std::to_string(player.volume) + "/" + std::to_string(VOLUME_MAX)); return; }
+  int v = atoi(arg.c_str());
+  if (v < 0 || v > VOLUME_MAX) { termPrint("volume must be 0-" + std::to_string(VOLUME_MAX), 2); return; }
+  player.volume = (uint8_t)v;
+  audio.setVolume(player.volume);
+  saveSettings();
+  termPrint("volume " + std::to_string(v));
+}
+
+static void termSettings() {
+  termPrint(std::string("autodl  ") + (autoDownload ? "on" : "off") + "   /set autodl on|off");
+  termPrint("skip    " + std::to_string(skipSec) + "s     /set skip <sec>");
+  termPrint(std::string("theme   ") + THEMES[themeIdx].name + "     /theme list");
+  termPrint("vol     " + std::to_string(player.volume) + "/" + std::to_string(VOLUME_MAX) + "     /vol <n>");
+  termPrint(std::string("order   ") + (episodesOldestFirst ? "oldest first" : "newest first") + "   /order");
+  termPrint(std::string("channel ") + channels[chanIdx].name);
+}
+
+static void termSet(const std::vector<std::string>& a) {
+  if (a.size() < 2) { termPrint("usage: /set <key> <value>", 2); return; }
+  const std::string& k = a[0];
+  const std::string& v = a[1];
+  if (k == "autodl") {
+    if (v != "on" && v != "off") { termPrint("autodl takes on or off", 2); return; }
+    autoDownload = (v == "on");
+  } else if (k == "skip") {
+    int n = atoi(v.c_str());
+    if (n < 5 || n > 300) { termPrint("skip must be 5-300 seconds", 2); return; }
+    skipSec = n;
+  } else if (k == "theme") {
+    termSet({"theme_pick", v});  // handled below
+    return;
+  } else if (k == "theme_pick") {
+    for (int i = 0; i < THEME_COUNT; ++i) {
+      if (v == THEMES[i].name) { applyTheme(i); saveSettings(); termPrint("theme " + v); return; }
+    }
+    termPrint("unknown theme (try /theme list)", 2);
+    return;
+  } else {
+    termPrint("unknown setting: " + k, 2);
+    return;
+  }
+  saveSettings();
+  termPrint("ok");
+}
+
+static void termTheme(const std::string& arg) {
+  if (arg.empty() || arg == "list") {
+    std::string names;
+    for (int i = 0; i < THEME_COUNT; ++i) {
+      names += THEMES[i].name;
+      if (i == themeIdx) names += "*";
+      if (i + 1 < THEME_COUNT) names += "  ";
+    }
+    termPrint(names);
+    return;
+  }
+  termSet({"theme_pick", arg});
+}
+
+static void termChannels(const std::string& arg) {
+  if (arg.empty()) {
+    for (int i = 0; i < (int)channels.size(); ++i) {
+      char num[8];
+      snprintf(num, sizeof(num), "%c%2d ", i == chanIdx ? '*' : ' ', i + 1);
+      termPrint(std::string(num) + channels[i].name);
+    }
+    return;
+  }
+  int n = atoi(arg.c_str());
+  if (n < 1 || n > (int)channels.size()) { termPrint("no such channel", 2); return; }
+  switchChannel(n - 1);
+  termPrint("channel: " + channels[chanIdx].name + " (" + std::to_string(episodes.size()) + " episodes)");
+}
+
+static void termExec(const std::string& raw) {
+  // trim
+  size_t b = raw.find_first_not_of(" \t");
+  if (b == std::string::npos) return;
+  std::string line = raw.substr(b);
+  while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) line.pop_back();
+  termPrint("> " + line, 2);
+
+  std::vector<std::string> a;
+  if (line[0] != '/') {  // plain text = search
+    searchQuery = line;
+    shows.clear();
+    showsAreSearch = true;
+    runSearch();
+    termShowShows();
+    return;
+  }
+  size_t sp = line.find(' ');
+  std::string cmd = line.substr(1, sp == std::string::npos ? std::string::npos : sp - 1);
+  std::string rest = sp == std::string::npos ? "" : line.substr(sp + 1);
+  for (auto& c : cmd) c = (char)tolower((unsigned char)c);
+  // split rest into words
+  {
+    size_t i = 0;
+    while (i < rest.size()) {
+      while (i < rest.size() && rest[i] == ' ') ++i;
+      size_t j = i;
+      while (j < rest.size() && rest[j] != ' ') ++j;
+      if (j > i) a.push_back(rest.substr(i, j - i));
+      i = j;
+    }
+  }
+  std::string arg0 = a.empty() ? "" : a[0];
+
+  if (cmd == "help" || cmd == "?") termHelp();
+  else if (cmd == "clear") termLog.clear();
+  else if (cmd == "quit" || cmd == "exit") returnToLauncher();
+  else if (cmd == "list") termShowEpisodes();
+  else if (cmd == "play") {
+    int n = arg0.empty() ? cursor + 1 : atoi(arg0.c_str());
+    termPlay(n - 1);
+  }
+  else if (cmd == "pause") termPauseToggle();
+  else if (cmd == "stop") termStop();
+  else if (cmd == "next") termPlay((player.current < 0 ? cursor : player.current) + 1);
+  else if (cmd == "prev") termPlay((player.current < 0 ? cursor : player.current) - 1);
+  else if (cmd == "skip") termSkip(arg0);
+  else if (cmd == "status") termStatus();
+  else if (cmd == "vol" || cmd == "volume") termVolume(arg0);
+  else if (cmd == "chan" || cmd == "channel") termChannels(arg0);
+  else if (cmd == "charts" || cmd == "top") { openCharts(); termShowShows(); }
+  else if (cmd == "search" || cmd == "find") {
+    if (rest.empty()) { termPrint("usage: /search <term>", 2); return; }
+    searchQuery = rest;
+    runSearch();
+    termShowShows();
+  }
+  else if (cmd == "open") {
+    int n = atoi(arg0.c_str());
+    if (n < 1 || n > (int)shows.size()) { termPrint("no such show (run /charts or /search first)", 2); return; }
+    openShow(n - 1);
+    termPrint(statusMsg.empty() ? "loaded " + activeFeedName + " (" + std::to_string(episodes.size()) + " episodes)" : statusMsg,
+              statusMsg.empty() ? 0 : 2);
+  }
+  else if (cmd == "download" || cmd == "dl") {
+    int idx = arg0.empty() ? cursor : atoi(arg0.c_str()) - 1;
+    if (idx < 0 || idx >= (int)episodes.size()) { termPrint("no such episode", 2); return; }
+    bool ok = downloadEpisode(idx);
+    termPrint(ok ? "saved" : statusMsg, ok ? 0 : 2);
+  }
+  else if (cmd == "rm") {
+    int idx = arg0.empty() ? cursor : atoi(arg0.c_str()) - 1;
+    deleteLocalCopy(idx);
+    termPrint(statusMsg);
+  }
+  else if (cmd == "order") { toggleEpisodeOrder(); termPrint(statusMsg); }
+  else if (cmd == "settings") termSettings();
+  else if (cmd == "set") termSet(a);
+  else if (cmd == "theme") termTheme(arg0);
+  else if (cmd == "wifi") {
+    bool connected = openPortal();
+    if (connected && episodes.empty()) fetchWithProgress();
+    termPrint(connected ? "wi-fi connected" : "wi-fi not set up", connected ? 0 : 2);
+  }
+  else termPrint("unknown command: /" + cmd + "  (try /help)", 2);
+}
+
+// Reads the keyboard once per loop pass. Keys are edge-triggered so a held key types once.
+static void termPollKeyboard() {
+  auto& kb = M5Cardputer.Keyboard;
+  auto st = kb.keysState();
+  static bool hadKeys = false, lastEnter = false, lastDel = false;
+  bool has = !st.word.empty();
+  if (has && !hadKeys) {
+    for (char c : st.word) {
+      if (c >= 32 && c < 127 && termInput.size() < TERM_INPUT_MAX) termInput += c;
+    }
+    uiDirty = true;
+  }
+  hadKeys = has;
+  if (st.del && !lastDel && !termInput.empty()) {
+    termInput.pop_back();
+    uiDirty = true;
+  }
+  lastDel = st.del;
+  if (st.enter && !lastEnter) {
+    std::string line = termInput;
+    termInput.clear();
+    termExec(line);
+    uiDirty = true;
+  }
+  lastEnter = st.enter;
+}
+
+static void drawTerminal() {
+  auto& d = M5.Display;
+  d.fillScreen(C_BG);
+  d.setFont(&fonts::efontCN_16);
+  d.setTextDatum(m5gfx::textdatum_t::top_left);
+  const int w = d.width();
+  const int h = d.height();
+
+  // status bar
+  const char* state = paused ? "PAUSE" : (audio.isRunning() ? "PLAY" : "STOP");
+  std::string st = std::string(wifiOk ? "WiFi:OK " : "WiFi:NG ") + state;
+  if (!statusMsg.empty()) st += " " + statusMsg;
+  d.setTextColor(C_ACCENT, C_BG);
+  d.drawString(fitText(st, w - 4).c_str(), 2, 0);
+  d.fillRect(0, TERM_STATUS_H + 1, w, 1, C_DIM);
+
+  // log: wrap the newest lines, show the last TERM_ROWS rows
+  std::vector<TermLine> rows;
+  for (int i = (int)termLog.size() - 1; i >= 0 && (int)rows.size() < TERM_ROWS; --i) {
+    auto parts = wrapText(termLog[i].text, w - 4, 4);
+    for (int j = (int)parts.size() - 1; j >= 0; --j) {
+      rows.push_back({parts[j], termLog[i].kind});
+      if ((int)rows.size() >= TERM_ROWS) break;
+    }
+  }
+  int y = TERM_STATUS_H + 4;
+  for (int i = (int)rows.size() - 1; i >= 0; --i) {
+    uint16_t col = rows[i].kind == 2 ? C_ACCENT : (rows[i].kind == 1 ? C_DIM : C_TEXT);
+    d.setTextColor(col, C_BG);
+    d.drawString(rows[i].text.c_str(), 2, y);
+    y += 16;
+  }
+
+  // prompt
+  std::string prompt = "> " + termInput + "_";
+  d.setTextColor(C_ACCENT, C_BG);
+  d.drawString(fitText(prompt, w - 4).c_str(), 2, h - 16);
+}
+#endif  // !PODCAST_TARGET_STICKS3
+
 static void drawUI() {
+#ifndef PODCAST_TARGET_STICKS3
+  drawTerminal();
+  return;
+#endif
   drawStatusBar();
   if (view == VIEW_LIST) {
     drawListPage();
@@ -1434,6 +1867,10 @@ static void returnToLauncher() {
 }
 
 static void handleKeys() {
+#ifndef PODCAST_TARGET_STICKS3
+  termPollKeyboard();
+  return;  // the old key-shortcut layer below is only used by the StickS3
+#endif
 #ifdef PODCAST_TARGET_STICKS3
   // ---- StickS3 two-button input layer: translates BtnA/BtnB events into the same input primitives as the keyboard ----
   // list page: A click=down  A long-hold repeat=up  B click=play selected  B hold 1.5s=WiFi setup
@@ -1749,12 +2186,7 @@ void setup() {
     sdSPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
     sdReady = SD.begin(PIN_SD_CS, sdSPI, 25000000);
     Serial.printf("[sd] %s\n", sdReady ? "mounted" : "not found");
-    {
-      Preferences p;
-      p.begin("app", true);
-      autoDownload = p.getBool("autodl", true);
-      p.end();
-    }
+    loadSettings();
   }
 
   bool fromSD = false;
@@ -1958,6 +2390,11 @@ void loop() {
   M5.update();  // refresh BtnA/BtnB state (for wasClicked/isPressed)
 #else
   M5Cardputer.update();
+  static bool welcomed = false;
+  if (!welcomed) {
+    welcomed = true;
+    termPrint("PodcastPlayer  type /help for commands");
+  }
 #endif
   handleKeys();
 #ifdef PODCAST_TARGET_STICKS3
@@ -1983,11 +2420,18 @@ void loop() {
 
   // Player page progress bar partial refresh once per second (a static page isn't fully redrawn)
   static uint32_t lastProgressMs = 0;
+#ifndef PODCAST_TARGET_STICKS3
+  if (audio.isRunning() && !paused && millis() - lastProgressMs >= 1000) {
+    lastProgressMs = millis();
+    uiDirty = true;  // terminal status bar shows the playing state
+  }
+#else
   if (view == VIEW_PLAYER && audio.isRunning() && !paused &&
       millis() - lastProgressMs >= 1000) {
     lastProgressMs = millis();
     drawPlayerPage(false);
   }
+#endif
 
   // While playing, check WiFi every pass: a drop cleanly stops the stream immediately.
   // Continuing to decode on a dead socket is the root cause of crackle for a few minutes then crash-reboot
