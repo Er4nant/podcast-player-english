@@ -1,13 +1,13 @@
-"""构建后把应用固件复制到 dist/（文件名按编译环境区分）。
+"""Copy the application firmware to dist/ after the build (the filename varies by build environment).
 
-M5Launcher 只接受单个应用镜像（firmware.bin），不做 0x0 合并 bin。
+M5Launcher only accepts a single application image (firmware.bin); it does not use a 0x0 merged bin.
 """
 Import("env")  # noqa: F405  SCons global provided by PIO
 
 import os
 import shutil
 
-# 编译环境 -> dist 输出文件名
+# build environment -> dist output filename
 OUTPUT_NAMES = {
     "cardputer-adv-podcast": "PodcastPlayer.bin",
     "m5stick-s3-podcast": "PodcastPlayer_StickS3.bin",

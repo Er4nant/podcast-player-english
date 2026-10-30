@@ -1,11 +1,11 @@
-# 构建产物
+# Build outputs
 .pio/
 dist/
 
-# 旧版本备份（含历史固件，勿上传）
+# Old backups (may contain historical firmware; do not upload)
 backup/
 
-# 串口调试日志
+# Serial debug logs
 *.log
 
 # Python

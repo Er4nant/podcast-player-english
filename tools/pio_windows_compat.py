@@ -6,7 +6,7 @@
    @response file. SCons (>=4.4) writes it as UTF-8 by default, but
    MinGW-based cross compilers (xtensa-esp32s3-elf-gcc etc.) read raw
    bytes and resolve paths with the ANSI code page (GBK on Chinese
-   Windows). Non-ASCII paths (e.g. C:\\Users\\<中文名>\\...) then turn
+   Windows). Non-ASCII paths (e.g. C:\\Users\\<non-ASCII name>\\...) then turn
    into garbage and the compiler reports
    "fatal error: <header>: No such file or directory" for headers that
    exist. Fix: encode the response file with the system ANSI code page

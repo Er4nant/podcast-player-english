@@ -1,106 +1,106 @@
 # PodcastPlayer
 
-M5Stack 掌上播客机（ESP32-S3）：开机自动连网，从 RSS 拉取节目列表，串流播放 m4a/mp3，黑白屏 UI + 自动生成的文字封面。**支持两个硬件目标**：
+M5Stack handheld podcast player (ESP32-S3): connects to WiFi automatically on boot, pulls the episode list from RSS, streams m4a/mp3, monochrome screen UI + auto-generated text cover art. **Supports two hardware targets**:
 
-- **Cardputer ADV**：全键盘操作，SD 卡免烧录换频道
-- **StickS3**：双键手势操作，配网页直接改 RSS（免烧录换台）
+- **Cardputer ADV**: full keyboard input, swap channels from the SD card without reflashing
+- **StickS3**: two-button gesture input, edit RSS directly on the config web page (swap stations without reflashing)
 
-![硬件](https://img.shields.io/badge/hardware-Cardputer%20ADV%20%7C%20StickS3-black) ![框架](https://img.shields.io/badge/PlatformIO-Arduino--ESP32-orange)
+![Hardware](https://img.shields.io/badge/hardware-Cardputer%20ADV%20%7C%20StickS3-black) ![Framework](https://img.shields.io/badge/PlatformIO-Arduino--ESP32-orange)
 
-## 功能
+## Features
 
-- **WiFiManager 免配置组网**：首次开机设备自动开热点 `PodcastPlayer`，手机连接后弹出/访问 `192.168.4.1` 选 WiFi 输密码，之后每次开机自动直连（凭据存 NVS）。列表页按 `0` 随时重配
-- **多频道**：SD 卡根目录放一个 `channels.txt` 即可增删频道，**换频道零烧录**；按 Tab 打开频道页切换，选择自动记忆
-- **文字封面**：无需任何图片资源，封面按频道名自动生成（专属配色渐变徽章 + 大字频道名），同名频道永远同色
-- **在线串流**：audioI2S 后端，支持 M4A/AAC/MP3/WAV/FLAC，HTTPS 免证书、重定向自动跟随
-- **播放页**：封面 + 节目名 + 两行标题 + 进度条 + 已播/总时长，每秒局部刷新
-- **SD 卡容错链**：SD 配置 → NVS 缓存 → 编译期内嵌，拔卡/坏卡/txt 写错都能自动降级，不会变砖
+- **WiFiManager zero-config networking**: on first boot the device opens a hotspot `PodcastPlayer`; connect from your phone and a captive portal at `192.168.4.1` opens to pick WiFi and enter the password. After that it reconnects automatically on every boot (credentials stored in NVS). Press `0` on the list page to reconfigure at any time
+- **Multiple channels**: drop a `channels.txt` in the SD card root to add or remove channels — **switch channels with zero reflashing**; press Tab to open the channel page and switch, your selection is remembered automatically
+- **Text cover art**: no image assets needed; the cover is generated from the channel name (a gradient badge with a dedicated color scheme + large channel name), and channels with the same name always get the same color
+- **Online streaming**: audioI2S backend, supports M4A/AAC/MP3/WAV/FLAC, HTTPS without certificates, redirects followed automatically
+- **Playback page**: cover art + show name + two-line title + progress bar + elapsed/total time, partially refreshed every second
+- **SD card fault-tolerance chain**: SD config → NVS cache → compile-time built-in; removing the card, a bad card, or a malformed txt all fall back gracefully and never brick the device
 
-## 硬件
+## Hardware
 
-| 项 | Cardputer ADV | StickS3 |
+| Item | Cardputer ADV | StickS3 |
 |---|---|---|
-| SoC | ESP32-S3（无 PSRAM） | ESP32-S3（8MB OPI PSRAM） |
-| 音频 | ES8311，I2S_NUM_1（BCLK 41 / WS 43 / DOUT 42），外放与 3.5mm 同响 | ES8311，I2S_NUM_0（BCLK 17 / WS 15 / DOUT 14 / MCLK 18），功放由 M5PM1 使能 |
-| 屏幕 | 240x135（M5GFX 自动适配） | 135x240 原生 + rotation 1 → 240x135 |
-| 输入 | 全键盘 | A 键（G11）/ B 键（G12）手势 |
-| 频道 | SD 卡 `channels.txt`，免烧录换台 | 配网页改 RSS（存 NVS），免烧录换台 |
-| PSRAM | 无（输入环 12KB） | 有（音频缓冲宽裕） |
-| CPU | 240MHz | 160MHz（降发热，AAC 解码余量充足） |
+| SoC | ESP32-S3 (no PSRAM) | ESP32-S3 (8MB OPI PSRAM) |
+| Audio | ES8311, I2S_NUM_1 (BCLK 41 / WS 43 / DOUT 42), speaker and 3.5mm output both active | ES8311, I2S_NUM_0 (BCLK 17 / WS 15 / DOUT 14 / MCLK 18), amplifier enabled by M5PM1 |
+| Display | 240x135 (auto-adapted by M5GFX) | 135x240 native + rotation 1 → 240x135 |
+| Input | Full keyboard | A button (G11) / B button (G12) gestures |
+| Channels | SD card `channels.txt`, swap stations without reflashing | Edit RSS on the config web page (stored in NVS), swap stations without reflashing |
+| PSRAM | None (12KB input ring) | Yes (ample audio buffering) |
+| CPU | 240MHz | 160MHz (reduced heat, plenty of headroom for AAC decoding) |
 
-## 按键（Cardputer ADV）
+## Buttons (Cardputer ADV)
 
-| 键 | 列表页 | 播放页 | 频道页 |
+| Key | List page | Playback page | Channel page |
 |---|---|---|---|
-| `w` / `;` | 光标上移 | 返回列表 | 上移 |
-| `s` / `.` | 光标下移 | 返回列表 | 下移 |
-| `Enter` | 播放/打开播放页/继续 | 暂停·续播·重播 | 切换频道 |
-| `+` / `-` | 音量 ± | 音量 ± | — |
-| `0` | WiFi 配网 | — | 重新扫描 |
-| `Tab` | 频道页 | — | 返回列表 |
-| `` ` `` | 退回 M5Launcher | 同左 | 同左 |
+| `w` / `;` | Cursor up | Back to list | Up |
+| `s` / `.` | Cursor down | Back to list | Down |
+| `Enter` | Play / open playback page / resume | Pause · resume · replay | Switch channel |
+| `+` / `-` | Volume ± | Volume ± | — |
+| `0` | WiFi setup | — | Rescan |
+| `Tab` | Channel page | — | Back to list |
+| `` ` `` | Return to M5Launcher | Same | Same |
 
-## 按键（StickS3）
+## Buttons (StickS3)
 
-| 手势 | 列表页 | 播放页 |
+| Gesture | List page | Playback page |
 |---|---|---|
-| A 单击 | 光标下移 | 返回列表 |
-| A 长按 | 光标上移（连发） | 音量 +（连发） |
-| B 单击 | 播放 | 暂停/续播 |
-| B 长按 1.5s | WiFi 配网热点 | 音量 −（连发） |
+| A single click | Cursor down | Back to list |
+| A long press | Cursor up (auto-repeat) | Volume + (auto-repeat) |
+| B single click | Play | Pause/resume |
+| B long press 1.5s | WiFi setup hotspot | Volume − (auto-repeat) |
 
-## 频道配置
+## Channel Configuration
 
-**Cardputer ADV**：SD 卡根目录放 `channels.txt`（UTF-8，`#` 开头为注释行）：
+**Cardputer ADV**: put `channels.txt` in the SD card root (UTF-8, lines starting with `#` are comments):
 
 ```
-# 格式：频道名|RSS地址
-XX播客|https://feed.xyzfm.space/xxxxxxxxxxxxxxxx
+# Format: Channel Name|RSS URL
+My Podcast|https://example.com/feed.xml
 ```
 
-封面自动生成，不需要图片。不加 SD 卡也能用：仓库里的 `channels.txt` 会在编译时内嵌为兜底频道表。
+Cover art is generated automatically, no images needed. It also works without an SD card: the `channels.txt` in the repo is embedded at compile time as the fallback channel list.
 
-**StickS3**：列表页 B 键长按 1.5 秒开配网热点，手机连接 `PodcastPlayer` 后在弹出的配置页里直接修改「频道名」和「播客RSS地址」，保存后自动拉取新频道（存在设备 NVS 里，重启不丢）。把 RSS 框清空再保存 = 恢复固件内置频道。
+**StickS3**: long-press the B button on the list page for 1.5s to open the setup hotspot; connect your phone to `PodcastPlayer` and edit "Channel Name" and "Podcast RSS URL" directly on the config page that pops up. Saving pulls the new channel automatically (stored in the device NVS, survives reboots). Clearing the RSS field and saving restores the firmware's built-in channels.
 
-## 编译
+## Build
 
 ```bash
 cd podcast_player
 pio run -e cardputer-adv-podcast          # Cardputer ADV
 pio run -e m5stick-s3-podcast             # StickS3
-pio run -e cardputer-adv-podcast -t monitor   # 串口日志（115200）
+pio run -e cardputer-adv-podcast -t monitor   # serial log (115200)
 ```
 
-产物自动复制到 `dist/`：Cardputer 为 `PodcastPlayer.bin`，StickS3 为 `PodcastPlayer_StickS3.bin`。刷机：把 bin 拷进 SD 卡，用 M5Launcher 选择刷入（单应用镜像，不动 bootloader/分区表）；Cardputer 按 `` ` `` 随时返回 Launcher。
+Build artifacts are copied to `dist/` automatically: `PodcastPlayer.bin` for Cardputer, `PodcastPlayer_StickS3.bin` for StickS3. To flash: copy the bin to an SD card and pick it in M5Launcher (a single-app image that leaves the bootloader/partition table untouched); on Cardputer press `` ` `` to return to the Launcher at any time.
 
-> Windows 中文用户名环境：`tools/pio_windows_compat.py` 已处理 SCons 响应文件编码问题，已挂到 pre 脚本，无需额外操作。
+> Windows with a non-ASCII username: `tools/pio_windows_compat.py` handles the SCons response-file encoding issue and is already wired into the pre script, no extra steps needed.
 >
-> 解码任务栈补丁：`tools/patch_audio_stack.py` 在编译前把 audioI2S 解码任务栈从 3300 提到 8192（AAC 解码调用链深，默认栈会溢出），对两个环境自动生效。
+> Decoder task stack patch: `tools/patch_audio_stack.py` bumps the audioI2S decoder task stack from 3300 to 8192 before building (the AAC decode call chain is deep and the default stack overflows); applies automatically to both environments.
 
-## 依赖
+## Dependencies
 
-| 库 | 版本 | 用途 |
+| Library | Version | Purpose |
 |---|---|---|
-| [M5Cardputer](https://github.com/m5stack/M5Cardputer) | 1.1.1 | 键盘/板级定义 |
-| [M5GFX](https://github.com/m5stack/M5GFX) / M5Unified | 0.2.33 / 0.2.26 | 屏幕驱动 |
-| [ESP32-audioI2S](https://github.com/schreibfaul1/ESP32-audioI2S) | 3.0.12 | 音频串流解码 |
-| [WiFiManager](https://github.com/tzapu/WiFiManager) | 2.0.17 | captive portal 配网 |
-| [TinyXML2](https://github.com/leethomason/tinyxml2) | 9.0.0 | RSS 解析 |
+| [M5Cardputer](https://github.com/m5stack/M5Cardputer) | 1.1.1 | Keyboard/board definitions |
+| [M5GFX](https://github.com/m5stack/M5GFX) / M5Unified | 0.2.33 / 0.2.26 | Display driver |
+| [ESP32-audioI2S](https://github.com/schreibfaul1/ESP32-audioI2S) | 3.0.12 | Audio streaming decoder |
+| [WiFiManager](https://github.com/tzapu/WiFiManager) | 2.0.17 | captive portal setup |
+| [TinyXML2](https://github.com/leethomason/tinyxml2) | 9.0.0 | RSS parsing |
 
-## 目录结构
+## Directory Structure
 
 ```
 podcast_player/
-├── platformio.ini        # 两个环境：cardputer-adv-podcast / m5stick-s3-podcast
-├── channels.txt          # 兜底频道表（编译时内嵌；Cardputer 正式用放 SD 卡）
+├── platformio.ini        # Two environments: cardputer-adv-podcast / m5stick-s3-podcast
+├── channels.txt          # Fallback channel list (embedded at compile time; Cardputer uses the SD card copy in production)
 ├── src/
-│   ├── main.cpp          # 全部应用逻辑（PODCAST_TARGET_STICKS3 区分板级差异）
-│   └── channels.h        # gen_channels.py 自动生成，勿手改
+│   ├── main.cpp          # All application logic (PODCAST_TARGET_STICKS3 distinguishes board differences)
+│   └── channels.h        # auto-generated by gen_channels.py, do not edit by hand
 └── tools/
-    ├── gen_channels.py       # 预构建：channels.txt -> channels.h
-    ├── patch_audio_stack.py  # 预构建：audioI2S 解码任务栈 3300 -> 8192
-    ├── deploy_dist.py        # 后构建：firmware.bin -> dist/（按环境命名）
-    ├── serial_dump.py        # 调试：pyserial 串口监听落盘
+    ├── gen_channels.py       # pre-build: channels.txt -> channels.h
+    ├── patch_audio_stack.py  # pre-build: audioI2S decoder task stack 3300 -> 8192
+    ├── deploy_dist.py        # post-build: firmware.bin -> dist/ (named per environment)
+    ├── serial_dump.py        # debug: pyserial serial monitor to disk
     └── pio_windows_compat.py
 ```
 

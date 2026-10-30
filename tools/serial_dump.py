@@ -1,6 +1,6 @@
-# 崩溃取证用：把设备串口原始输出持续追加写入日志文件。
-# 用法: python tools/serial_dump.py COM10 crash.log
-# 设备重启导致端口断开时自动重连（COM 号不变的情况）。
+# Crash forensics: continuously append the device's raw serial output to a log file.
+# Usage: python tools/serial_dump.py COM10 crash.log
+# Auto-reconnect when the port drops because the device rebooted (COM number unchanged).
 import sys
 import time
 
@@ -23,7 +23,7 @@ def main() -> None:
                             f.write(data)
                             f.flush()
         except serial.SerialException as e:
-            # 端口消失（设备崩溃重启/重新枚举），2 秒后重试
+            # port disappeared (device crashed/rebooted or re-enumerated), retry in 2 seconds
             print(f"[serial_dump] port lost ({e}), retrying in 2s...", flush=True)
             time.sleep(2)
         except KeyboardInterrupt:

@@ -1,8 +1,11 @@
-# 构建前置补丁：把 ESP32-audioI2S 解码任务栈从 3300 字节扩到 8192。
-# AAC(m4a) 解码调用链很深，3300 字节会在播放数分钟后栈溢出导致硬崩溃。
-# libdeps 按编译环境各装一份库，此脚本对已安装的所有副本幂等打补丁。
-# （首次全新安装依赖时本脚本先于依赖下载运行，那一次补丁不会生效——
-#   再跑一次构建即可，libdeps 已就位，补丁随之应用。）
+# Pre-build patch: enlarge the ESP32-audioI2S decoder task stack from 3300 bytes to 8192.
+# The AAC(m4a) decode call chain is deep; 3300 bytes overflows the stack after a few minutes
+# of playback and causes a hard crash.
+# libdeps installs a separate library copy per build environment; this script idempotently
+# patches every installed copy.
+# (On a fresh dependency install this script runs before the dependencies are downloaded,
+#   so the patch does not take effect that time — just build once more; libdeps is in place
+#   and the patch is applied.)
 import glob
 import io
 import os
@@ -14,7 +17,7 @@ def patch_file(path):
     with io.open(path, "r", encoding="utf-8") as f:
         src = f.read()
     if MARK in src:
-        return False  # 已打过
+        return False  # already patched
     target = '"PeriodicTask", 3300,'
     if target not in src:
         print("[patch_audio_stack] WARN: target not found in %s" % path)
