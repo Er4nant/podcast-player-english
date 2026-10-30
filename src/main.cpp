@@ -1684,7 +1684,7 @@ static void termChannels(const std::string& arg) {
 #include "eggs.h"  // hidden features (private file is gitignored; public build uses the stub)
 
 static void termExec(const std::string& raw) {
-  if (eggWantsSecret()) { eggSecret(raw); return; }  // sudo password: never echoed, never logged
+  if (eggWantsSecret()) { eggSecret(raw); return; }  // secret input prompt: never echoed or logged
   // trim
   size_t b = raw.find_first_not_of(" \t");
   if (b == std::string::npos) return;
