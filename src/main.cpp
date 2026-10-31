@@ -850,6 +850,7 @@ static void parseEpisodeXml(const std::string& xml, std::vector<Episode>& out) {
 // bypassing mbedtls (the TLS stack uses a lot of memory, the biggest heap peak during fetch);
 // in plaintext mode a redirect to https fails, handled by a fallback at the call site.
 extern const uint8_t _binary_x509_crt_bundle_start[];  // IDF CA bundle (libmbedtls)
+static std::string netLastErr = "none yet";  // shown by /fetch and /diag
 static bool fetchEpisodesFrom(const char* url, bool isHttps,
                               std::vector<Episode>& eps) {
   WiFiClientSecure secureClient;
@@ -867,6 +868,7 @@ static bool fetchEpisodesFrom(const char* url, bool isHttps,
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     Serial.printf("[rss] HTTP GET code=%d\n", code);
+    netLastErr = std::string(isHttps ? "https" : "http") + " " + (code < 0 ? http.errorToString(code).c_str() : ("HTTP " + std::to_string(code)).c_str());
     http.end();
     return false;
   }
@@ -930,6 +932,7 @@ static bool fetchEpisodesFrom(const char* url, bool isHttps,
     }
   }
   http.end();
+  netLastErr = eps.empty() ? "no episodes in feed" : "ok";
   Serial.printf("[rss] %u episodes, %u bytes\n",
                 (unsigned)eps.size(), (unsigned)total);
   return !eps.empty();
@@ -1510,6 +1513,8 @@ static void termHelp() {
   termPrint("  /set <key> <val>   autodl on|off, skip <sec>, theme <name>");
   termPrint("  /theme [name]      list or set theme");
   termPrint("  /wifi              Wi-Fi setup hotspot");
+  termPrint("  /fetch             retry the feed");
+  termPrint("  /diag              network status");
   termPrint("  /clear             clear this log");
   termPrint("  /quit              back to launcher");
 }
@@ -1758,6 +1763,17 @@ static void termExec(const std::string& raw) {
     int idx = arg0.empty() ? cursor : atoi(arg0.c_str()) - 1;
     deleteLocalCopy(idx);
     termPrint(statusMsg);
+  }
+  else if (cmd == "fetch") {
+    termPrint("fetching " + std::string(activeFeedName.empty() ? channels[chanIdx].name : activeFeedName) + "...", 1);
+    fetchWithProgress();
+    termPrint(episodes.empty() ? "fetch failed: " + netLastErr : "ok: " + std::to_string(episodes.size()) + " episodes", episodes.empty() ? 2 : 0);
+  }
+  else if (cmd == "diag") {
+    termPrint(wifiOk ? std::string("wifi ok ") + WiFi.localIP().toString().c_str() : std::string("wifi down"));
+    termPrint("rssi " + std::to_string(WiFi.RSSI()) + " dBm  heap " + std::to_string(ESP.getFreeHeap() / 1024) + " KB");
+    termPrint("last net: " + netLastErr, 1);
+    termPrint("feed: " + std::string(channels[chanIdx].rss.c_str()), 1);
   }
   else if (cmd == "order") { toggleEpisodeOrder(); termPrint(statusMsg); }
   else if (cmd == "settings") termSettings();
